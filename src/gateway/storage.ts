@@ -93,6 +93,7 @@ export async function listGateways(): Promise<GatewayConfig[]> {
 export async function listGatewayInfo(): Promise<GatewayInfo[]> {
   const gateways = await listGateways();
   return gateways.map((g) => ({
+    id: g.id,
     name: g.name,
     provider: g.provider.type,
     channel: g.channel.type,

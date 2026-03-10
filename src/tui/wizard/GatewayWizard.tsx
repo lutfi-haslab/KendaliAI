@@ -15,6 +15,12 @@ import {
 } from "@inquirer/prompts";
 import { saveGateway, generateGatewayId } from "../../gateway/storage";
 import type { ProviderType, ChannelType, GatewayConfig } from "../../gateway/types";
+import {
+  createProvider,
+  ProviderNotImplementedError,
+  type ProviderInstance,
+  type ModelInfo,
+} from "../../providers";
 
 interface GatewayWizardProps {
   onComplete: () => void;
@@ -25,6 +31,7 @@ interface WizardState {
   step: number;
   provider: string;
   apiKey: string;
+  baseURL?: string;
   model: string;
   channel: string;
   botToken: string;
@@ -33,17 +40,12 @@ interface WizardState {
   name: string;
 }
 
-// Available models per provider
-const PROVIDER_MODELS: Record<string, string[]> = {
-  zai: ["zai-1", "zai-2"],
-  deepseek: ["deepseek-chat", "deepseek-coder"],
-};
-
 export function GatewayWizard({ onComplete, onCancel }: GatewayWizardProps) {
   const [state, setState] = useState<WizardState>({
     step: 1,
     provider: "",
     apiKey: "",
+    baseURL: undefined,
     model: "",
     channel: "telegram",
     botToken: "",
@@ -52,6 +54,28 @@ export function GatewayWizard({ onComplete, onCancel }: GatewayWizardProps) {
     name: "",
   });
   const [isProcessing, setIsProcessing] = useState(false);
+  const [providerInstance, setProviderInstance] = useState<ProviderInstance | null>(null);
+
+  // Get available models from provider instance or use defaults
+  const getAvailableModels = (): ModelInfo[] => {
+    if (providerInstance) {
+      return providerInstance.listModels();
+    }
+    // Fallback defaults
+    if (state.provider === "zai") {
+      return [
+        { id: "zai-1", name: "Zai-1", type: "chat", contextLength: 128000 },
+        { id: "zai-2", name: "Zai-2", type: "chat", contextLength: 128000 },
+      ];
+    }
+    if (state.provider === "deepseek") {
+      return [
+        { id: "deepseek-chat", name: "DeepSeek Chat", type: "chat", contextLength: 64000 },
+        { id: "deepseek-coder", name: "DeepSeek Coder", type: "chat", contextLength: 64000 },
+      ];
+    }
+    return [];
+  };
 
   useEffect(() => {
     let isMounted = true;
@@ -95,17 +119,56 @@ export function GatewayWizard({ onComplete, onCancel }: GatewayWizardProps) {
             },
           });
 
+          // Ask for custom base URL (optional)
+          const useCustomURL = await confirm({
+            message: "Use custom API base URL?",
+            default: false,
+          });
+
+          let baseURL: string | undefined;
+          if (useCustomURL) {
+            baseURL = await input({
+              message: "Enter custom base URL",
+              default: state.provider === "zai" 
+                ? "https://api.zai.ai/v1" 
+                : "https://api.deepseek.com/v1",
+            });
+          }
+
+          // Create provider instance to validate API key and get models
+          let provider: ProviderInstance | null = null;
+          try {
+            provider = createProvider(state.provider as ProviderType, {
+              apiKey,
+              baseURL,
+            });
+          } catch (error) {
+            if (error instanceof ProviderNotImplementedError) {
+              console.error(`\n❌ ${error.message}`);
+              console.log("Please select a different provider.\n");
+              if (isMounted) {
+                setState((s) => ({ ...s, step: 1, provider: "" }));
+              }
+              return;
+            }
+            throw error;
+          }
+
           if (isMounted) {
-            setState((s) => ({ ...s, step: 3, apiKey }));
+            setProviderInstance(provider);
+            setState((s) => ({ ...s, step: 3, apiKey, baseURL }));
           }
           return;
         }
 
         // Step 3: Select Model
         if (state.step === 3 && state.provider && !state.model) {
-          const models = PROVIDER_MODELS[state.provider] || [];
+          const models = getAvailableModels();
           const choices = [
-            ...models.map((m) => ({ name: m, value: m })),
+            ...models.map((m) => ({ 
+              name: `${m.name} (${m.contextLength?.toLocaleString() || 'unknown'} tokens)`, 
+              value: m.id 
+            })),
             { name: "[Type custom model name...]", value: "__custom__" },
           ];
 
@@ -282,6 +345,7 @@ export function GatewayWizard({ onComplete, onCancel }: GatewayWizardProps) {
               provider: {
                 type: state.provider as ProviderType,
                 apiKey: state.apiKey, // TODO: Encrypt this
+                baseURL: state.baseURL,
                 model: state.model,
               },
               channel: {
@@ -324,7 +388,7 @@ export function GatewayWizard({ onComplete, onCancel }: GatewayWizardProps) {
     return () => {
       isMounted = false;
     };
-  }, [state, onComplete, onCancel]);
+  }, [state, providerInstance, onComplete, onCancel]);
 
   return (
     <Box flexDirection="column" padding={1}>
