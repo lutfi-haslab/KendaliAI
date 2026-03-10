@@ -23,10 +23,40 @@ export interface ProviderConfig {
   defaultModel?: string;
 }
 
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface ChatCompletionResponse {
+  content: string;
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+  };
+  finishReason?: "stop" | "length" | "content_filter";
+}
+
+export interface EmbeddingResponse {
+  embedding: number[];
+  usage?: {
+    promptTokens: number;
+  };
+}
+
 export interface ProviderInstance {
   name: string;
   type: ProviderType;
   isConfigured(): boolean;
   getModel(modelId?: string): unknown;
   listModels(): ModelInfo[];
+  chat(prompt: string, options?: { systemPrompt?: string }): Promise<string>;
+  chatCompletion(
+    messages: ChatMessage[],
+    options?: {
+      temperature?: number;
+      maxTokens?: number;
+    },
+  ): Promise<ChatCompletionResponse>;
+  embeddings(input: string): Promise<EmbeddingResponse>;
 }
