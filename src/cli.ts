@@ -216,6 +216,16 @@ SKILLS MANAGEMENT:
   skills new <name>         Scaffold a new skill
   skills remove <name>      Remove a skill
 
+RAG (Retrieval-Augmented Generation):
+  rag ingest <source>       Ingest a document (file, URL, or text)
+  rag list                  List all documents
+  rag show <id>             Show document details
+  rag delete <id>           Delete a document
+  rag search <query>        Search for relevant documents
+  rag stats                 Show RAG statistics
+  rag clear                 Clear all RAG data
+  rag config                Show RAG configuration
+
 GATEWAY OPTIONS:
   -p, --port <port>    Gateway port (default: 42617)
   --host <host>        Gateway host (default: 127.0.0.1)
@@ -1823,6 +1833,13 @@ async function main(): Promise<void> {
     case "reset":
       await handleReset();
       break;
+    case "rag": {
+      // RAG (Retrieval-Augmented Generation) management
+      const subArgs = positionals.slice(1);
+      const { handleRAGCommand } = await import("./cli/rag");
+      await handleRAGCommand(subArgs);
+      break;
+    }
     default:
       console.error(`Unknown command: ${command}`);
       console.log("Run --help for usage information");
