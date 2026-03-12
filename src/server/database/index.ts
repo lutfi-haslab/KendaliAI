@@ -1,3 +1,5 @@
-// Database module exports
-export { dbManager, DatabaseManager } from "./db";
-export * from "./schema";
+/**
+ * KendaliAI Database Module
+ */
+
+export { initDatabase, getDatabase, closeDatabase, resetDatabase, dbManager, schema } from "./db";

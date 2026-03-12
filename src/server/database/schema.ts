@@ -1,261 +1,357 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+/**
+ * KendaliAI Database Schema - ZeroClaw-Inspired Architecture
+ * 
+ * Lightweight, optimized schema with:
+ * - Gateway pairing system
+ * - Channel allowlists
+ * - Hybrid memory (FTS5 + vector)
+ * - Secure credential storage
+ */
+
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
 // ============================================
-// Users Table - PRD Section 24
-// ============================================
-export const users = sqliteTable("users", {
-  id: text("id").primaryKey(),
-  username: text("username").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  role: text("role").default("user").notNull(), // "admin" | "user"
-  apiKey: text("api_key").unique(),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
-});
-
-// ============================================
-// Agents Table - PRD Section 9
-// ============================================
-export const agents = sqliteTable("agents", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  description: text("description"),
-  status: text("status").default("active").notNull(), // "active" | "inactive" | "busy"
-  gatewayId: text("gateway_id"),
-  systemPrompt: text("system_prompt"),
-  model: text("model").default("gpt-4o"),
-  capabilities: text("capabilities"), // JSON array of capabilities
-  tools: text("tools"), // JSON array of tool names
-  temperature: text("temperature").default("0.7"),
-  maxTokens: integer("max_tokens").default(4096),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
-});
-
-// ============================================
-// Tasks Table - PRD Section 9
-// ============================================
-export const tasks = sqliteTable("tasks", {
-  id: text("id").primaryKey(),
-  agentId: text("agent_id").references(() => agents.id),
-  description: text("description").notNull(),
-  status: text("status").default("pending").notNull(), // "pending" | "in_progress" | "completed" | "failed"
-  priority: text("priority").default("normal"), // "low" | "normal" | "high"
-  result: text("result"),
-  error: text("error"),
-  metadata: text("metadata"), // JSON for additional data
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
-  completedAt: text("completed_at"),
-});
-
-// ============================================
-// Task Steps Table - PRD Section 9
-// ============================================
-export const taskSteps = sqliteTable("task_steps", {
-  id: text("id").primaryKey(),
-  taskId: text("task_id")
-    .references(() => tasks.id)
-    .notNull(),
-  stepOrder: integer("step_order").notNull(),
-  action: text("action").notNull(),
-  status: text("status").default("pending").notNull(), // "pending" | "running" | "completed" | "failed"
-  input: text("input"), // JSON input data
-  output: text("output"), // JSON output data
-  error: text("error"),
-  startedAt: text("started_at"),
-  completedAt: text("completed_at"),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-});
-
-// ============================================
-// Workflows Table - PRD Section 11
-// ============================================
-export const workflows = sqliteTable("workflows", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  description: text("description"),
-  status: text("status").default("draft").notNull(), // "draft" | "active" | "paused" | "archived"
-  nodes: text("nodes"), // JSON array of workflow nodes
-  edges: text("edges"), // JSON array of connections
-  triggers: text("triggers"), // JSON array of trigger configurations
-  variables: text("variables"), // JSON object of workflow variables
-  lastRunAt: text("last_run_at"),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
-});
-
-// ============================================
-// Workflow Runs Table - Track workflow executions
-// ============================================
-export const workflowRuns = sqliteTable("workflow_runs", {
-  id: text("id").primaryKey(),
-  workflowId: text("workflow_id")
-    .references(() => workflows.id)
-    .notNull(),
-  status: text("status").default("running").notNull(), // "running" | "completed" | "failed" | "cancelled"
-  trigger: text("trigger"), // What triggered this run
-  input: text("input"), // JSON input data
-  output: text("output"), // JSON output data
-  error: text("error"),
-  startedAt: text("started_at").default(sql`(CURRENT_TIMESTAMP)`),
-  completedAt: text("completed_at"),
-});
-
-// ============================================
-// Gateways Table - AI Provider configurations
+// GATEWAYS - AI Provider Configurations
 // ============================================
 export const gateways = sqliteTable("gateways", {
   id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  provider: text("provider").notNull(), // "openai" | "anthropic" | "ollama" | "vllm"
-  endpoint: text("endpoint"), // Custom API endpoint
-  apiKey: text("api_key"),
-  models: text("models"), // JSON array of available models
+  name: text("name").notNull().unique(),
+  
+  // Provider configuration
+  provider: text("provider").notNull(), // "openai" | "anthropic" | "ollama" | "zai" | "deepseek" | "custom"
+  endpoint: text("endpoint"), // Custom API endpoint URL
+  apiKeyEncrypted: text("api_key_encrypted"), // Encrypted API key
   defaultModel: text("default_model"),
-  isDefault: integer("is_default").default(0),
+  models: text("models"), // JSON array of available models
+  
+  // ZeroClaw-style security
+  requirePairing: integer("require_pairing").default(1),
+  allowPublicBind: integer("allow_public_bind").default(0),
+  workspaceOnly: integer("workspace_only").default(1),
+  
+  // Runtime config
   config: text("config"), // JSON for provider-specific config
-  status: text("status").default("active"), // "active" | "inactive" | "error"
+  status: text("status").default("stopped"), // "stopped" | "running" | "error"
   lastError: text("last_error"),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 // ============================================
-// Plugins Table - PRD Section 15
+// PAIRING - Gateway Security Pairing System
 // ============================================
-export const plugins = sqliteTable("plugins", {
+export const pairings = sqliteTable("pairings", {
   id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  version: text("version").notNull(),
-  description: text("description"),
-  author: text("author"),
-  enabled: integer("enabled").default(1),
-  config: text("config"), // JSON plugin configuration
-  manifest: text("manifest"), // JSON manifest content
-  installedAt: text("installed_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
+  gatewayId: text("gateway_id").references(() => gateways.id).notNull(),
+  
+  // 6-digit pairing code
+  pairingCode: text("pairing_code").notNull(), // 6-digit code
+  
+  // Bearer token (generated after pairing)
+  bearerToken: text("bearer_token"), // JWT or random token
+  tokenHash: text("token_hash"), // Hashed token for verification
+  
+  // Status
+  status: text("status").default("pending"), // "pending" | "paired" | "expired" | "revoked"
+  
+  // Metadata
+  pairedBy: text("paired_by"), // IP or identifier
+  userAgent: text("user_agent"),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  pairedAt: integer("paired_at", { mode: 'timestamp' }),
+  expiresAt: integer("expires_at", { mode: 'timestamp' }),
 });
 
 // ============================================
-// Tools Table - PRD Section 13
+// CHANNELS - Messaging Channel Configurations
+// ============================================
+export const channels = sqliteTable("channels", {
+  id: text("id").primaryKey(),
+  gatewayId: text("gateway_id").references(() => gateways.id),
+  
+  // Channel type
+  type: text("type").notNull(), // "telegram" | "discord" | "slack" | "whatsapp" | "webhook"
+  name: text("name").notNull(),
+  
+  // Channel credentials (encrypted)
+  credentialsEncrypted: text("credentials_encrypted"), // JSON encrypted credentials
+  
+  // ZeroClaw-style allowlist (deny-by-default)
+  allowedUsers: text("allowed_users"), // JSON array of allowed user IDs, ["*"] for all
+  
+  // Channel-specific config
+  config: text("config"), // JSON for channel-specific config
+  
+  // Status
+  enabled: integer("enabled").default(1),
+  status: text("status").default("stopped"), // "stopped" | "running" | "error"
+  lastError: text("last_error"),
+  lastMessageAt: integer("last_message_at", { mode: 'timestamp' }),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+});
+
+// ============================================
+// MEMORY - Hybrid Memory System (FTS5 + Vector)
+// ============================================
+export const memories = sqliteTable("memories", {
+  id: text("id").primaryKey(),
+  gatewayId: text("gateway_id").references(() => gateways.id),
+  
+  // Memory content
+  content: text("content").notNull(),
+  contentHash: text("content_hash"), // SHA-256 hash for deduplication
+  
+  // Source metadata
+  source: text("source"), // "user" | "agent" | "system" | "file"
+  sourceId: text("source_id"), // Reference to source (message ID, file path, etc.)
+  
+  // Embedding vector (stored as JSON array)
+  embedding: text("embedding"), // JSON array of floats
+  embeddingModel: text("embedding_model"), // Model used for embedding
+  
+  // Memory metadata
+  importance: real("importance").default(0.5), // 0.0 - 1.0 importance score
+  accessCount: integer("access_count").default(0),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  lastAccessedAt: integer("last_accessed_at", { mode: 'timestamp' }),
+});
+
+// ============================================
+// MESSAGES - Message History
+// ============================================
+export const messages = sqliteTable("messages", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  gatewayId: text("gateway_id").references(() => gateways.id),
+  channelId: text("channel_id").references(() => channels.id),
+  
+  // Message data
+  role: text("role").notNull(), // "user" | "assistant" | "system"
+  content: text("content").notNull(),
+  
+  // Sender info
+  senderId: text("sender_id"), // User ID from channel
+  senderName: text("sender_name"),
+  
+  // Metadata
+  tokens: integer("tokens").default(0),
+  model: text("model"), // Model used for response
+  latencyMs: integer("latency_ms"), // Response latency
+  
+  // Embedding for RAG
+  embedding: text("embedding"), // JSON array for semantic search
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+});
+
+// ============================================
+// TOOLS - Tool Registry
 // ============================================
 export const tools = sqliteTable("tools", {
   id: text("id").primaryKey(),
   name: text("name").notNull().unique(),
-  category: text("category"), // "browser" | "filesystem" | "messaging" | "system" | "custom"
+  
+  // Tool definition
+  category: text("category"), // "shell" | "file" | "http" | "browser" | "custom"
   description: text("description"),
-  schema: text("schema"), // JSON schema for input validation
-  permissionLevel: text("permission_level").default("allowed"), // "allowed" | "restricted" | "disabled"
+  inputSchema: text("input_schema"), // JSON Schema for input
+  
+  // Security
+  permissionLevel: text("permission_level").default("allowed"), // "allowed" | "restricted" | "forbidden"
+  requiresConfirmation: integer("requires_confirmation").default(0),
+  
+  // Usage tracking
   enabled: integer("enabled").default(1),
-  pluginId: text("plugin_id").references(() => plugins.id), // If tool is from a plugin
   usageCount: integer("usage_count").default(0),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 // ============================================
-// Messages Table - PRD Section 12
+// SKILLS - ZeroClaw-style Skills System
 // ============================================
-export const messages = sqliteTable("messages", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  adapter: text("adapter").notNull(), // "telegram" | "discord" | "whatsapp"
-  sender: text("sender").notNull(),
-  recipient: text("recipient"),
-  payload: text("payload").notNull(),
-  messageType: text("message_type").default("text"), // "text" | "command" | "media"
-  metadata: text("metadata"), // JSON for additional data
-  processed: integer("processed").default(0),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
+export const skills = sqliteTable("skills", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  version: text("version").notNull(),
+  
+  // Skill definition
+  description: text("description"),
+  instructions: text("instructions"), // SKILL.md content
+  manifest: text("manifest"), // TOML manifest as JSON
+  
+  // Security audit
+  auditStatus: text("audit_status").default("pending"), // "pending" | "approved" | "rejected"
+  auditNotes: text("audit_notes"),
+  
+  // Status
+  enabled: integer("enabled").default(1),
+  
+  // Timestamps
+  installedAt: integer("installed_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 // ============================================
-// AI Usage Table - PRD Section 7 (Usage Tracking)
+// HOOKS - Lifecycle Event Hooks
 // ============================================
-export const aiUsage = sqliteTable("ai_usage", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  provider: text("provider").notNull(),
-  model: text("model").notNull(),
+export const hooks = sqliteTable("hooks", {
+  id: text("id").primaryKey(),
   gatewayId: text("gateway_id").references(() => gateways.id),
-  requestId: text("request_id"),
-  tokensIn: integer("tokens_in").default(0),
-  tokensOut: integer("tokens_out").default(0),
-  totalTokens: integer("total_tokens").default(0),
-  cost: text("cost").default("0"), // Cost in USD
-  latencyMs: integer("latency_ms"), // Response latency in milliseconds
-  status: text("status").default("success"), // "success" | "error" | "timeout"
-  errorMessage: text("error_message"),
-  agentId: text("agent_id").references(() => agents.id),
-  workflowRunId: text("workflow_run_id").references(() => workflowRuns.id),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
+  
+  // Hook definition
+  event: text("event").notNull(), // "boot" | "message" | "command" | "error"
+  name: text("name").notNull(),
+  
+  // Hook config
+  config: text("config"), // JSON configuration
+  
+  // Execution
+  priority: integer("priority").default(0),
+  enabled: integer("enabled").default(1),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 // ============================================
-// Cache Table - PRD Section 7 (Request Caching)
+// TUNNELS - Tunnel Configuration
 // ============================================
-export const cache = sqliteTable("cache", {
+export const tunnels = sqliteTable("tunnels", {
+  id: text("id").primaryKey(),
+  gatewayId: text("gateway_id").references(() => gateways.id),
+  
+  // Tunnel type
+  provider: text("provider").notNull(), // "none" | "cloudflare" | "tailscale" | "ngrok" | "custom"
+  
+  // Tunnel config
+  config: text("config"), // JSON configuration (encrypted if sensitive)
+  
+  // Status
+  status: text("status").default("stopped"), // "stopped" | "running" | "error"
+  publicUrl: text("public_url"), // Public URL when tunnel is active
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+});
+
+// ============================================
+// HEARTBEATS - Scheduled Tasks
+// ============================================
+export const heartbeats = sqliteTable("heartbeats", {
+  id: text("id").primaryKey(),
+  gatewayId: text("gateway_id").references(() => gateways.id),
+  
+  // Task definition
+  name: text("name").notNull(),
+  task: text("task").notNull(), // Task to execute
+  
+  // Schedule
+  intervalMinutes: integer("interval_minutes").default(30),
+  lastRunAt: integer("last_run_at", { mode: 'timestamp' }),
+  nextRunAt: integer("next_run_at", { mode: 'timestamp' }),
+  
+  // Status
+  enabled: integer("enabled").default(0),
+  status: text("status").default("idle"), // "idle" | "running" | "error"
+  lastResult: text("last_result"),
+  lastError: text("last_error"),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+});
+
+// ============================================
+// EVENT LOGS - System Observability
+// ============================================
+export const eventLogs = sqliteTable("event_logs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  key: text("key").notNull().unique(),
-  value: text("value").notNull(),
-  contentType: text("content_type").default("application/json"),
-  hits: integer("hits").default(0),
-  expiresAt: text("expires_at"),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
+  
+  // Event classification
+  type: text("type").notNull(), // "gateway" | "channel" | "tool" | "memory" | "system"
+  level: text("level").notNull(), // "debug" | "info" | "warn" | "error"
+  
+  // Event data
+  message: text("message").notNull(),
+  data: text("data"), // JSON additional data
+  
+  // Context
+  gatewayId: text("gateway_id").references(() => gateways.id),
+  channelId: text("channel_id").references(() => channels.id),
+  correlationId: text("correlation_id"), // For tracing related events
+  
+  // Timestamp
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 // ============================================
-// System Config Table - General system settings
+// SYSTEM CONFIG - Key-Value Store
 // ============================================
 export const systemConfig = sqliteTable("system_config", {
   key: text("key").primaryKey(),
   value: text("value"),
   description: text("description"),
-  updatedAt: text("updated_at").default(sql`(CURRENT_TIMESTAMP)`),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
 
 // ============================================
-// Tools Log Table - Tool execution history
+// EMBEDDING CACHE - Response/Embedding Cache
 // ============================================
-export const toolsLog = sqliteTable("tools_log", {
+export const embeddingCache = sqliteTable("embedding_cache", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  toolName: text("tool_name").notNull(),
-  taskId: text("task_id").references(() => tasks.id),
-  workflowRunId: text("workflow_run_id").references(() => workflowRuns.id),
-  input: text("input"), // JSON input
-  output: text("output"), // JSON output
-  status: text("status").notNull(), // "success" | "error" | "timeout"
-  error: text("error"),
-  executionTimeMs: integer("execution_time_ms"),
-  executedAt: text("executed_at").default(sql`(CURRENT_TIMESTAMP)`),
+  
+  // Cache key (hash of input)
+  cacheKey: text("cache_key").notNull().unique(),
+  
+  // Cached data
+  inputText: text("input_text").notNull(),
+  embedding: text("embedding").notNull(), // JSON array
+  model: text("model").notNull(),
+  
+  // LRU tracking
+  accessCount: integer("access_count").default(0),
+  lastAccessedAt: integer("last_accessed_at", { mode: 'timestamp' }),
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  expiresAt: integer("expires_at", { mode: 'timestamp' }),
 });
 
 // ============================================
-// Event Logs Table - System observability
+// IDENTITY - AIEOS/OpenClaw Identity System
 // ============================================
-export const eventLogs = sqliteTable("event_logs", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  type: text("type").notNull(), // "agent" | "tool" | "workflow" | "gateway" | "system"
-  level: text("level").notNull(), // "info" | "warn" | "error" | "debug"
-  message: text("message").notNull(),
-  data: text("data"), // JSON additional data
-  source: text("source"), // Module/component that generated the event
-  correlationId: text("correlation_id"), // For tracing related events
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-});
-
-// ============================================
-// API Keys Table - Auth system
-// ============================================
-export const apiKeys = sqliteTable("api_keys", {
+export const identity = sqliteTable("identity", {
   id: text("id").primaryKey(),
-  userId: text("user_id").references(() => users.id),
-  name: text("name").notNull(),
-  keyHash: text("key_hash").notNull(),
-  prefix: text("prefix").notNull(), // First 8 chars for identification
-  permissions: text("permissions"), // JSON permissions array
-  lastUsedAt: text("last_used_at"),
-  expiresAt: text("expires_at"),
-  createdAt: text("created_at").default(sql`(CURRENT_TIMESTAMP)`),
-  revokedAt: text("revoked_at"),
+  gatewayId: text("gateway_id").references(() => gateways.id).notNull(),
+  
+  // Identity format
+  format: text("format").default("openclaw"), // "openclaw" | "aieos"
+  
+  // Identity content
+  content: text("content"), // JSON for AIEOS, markdown for OpenClaw
+  
+  // Identity sections (OpenClaw style)
+  identityMd: text("identity_md"), // IDENTITY.md content
+  soulMd: text("soul_md"), // SOUL.md content
+  userMd: text("user_md"), // USER.md content
+  agentsMd: text("agents_md"), // AGENTS.md content
+  
+  // Timestamps
+  createdAt: integer("created_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: 'timestamp' }).$defaultFn(() => new Date()),
 });
