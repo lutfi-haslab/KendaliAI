@@ -1,14 +1,15 @@
 /**
  * KendaliAI Vector Storage Module
  * 
- * Implements vector storage for RAG using SQLite with sqlite-vss extension.
- * Provides efficient similarity search with VSS indexes.
+ * Implements vector storage for RAG using Bun-native vector search.
+ * Since sqlite-vss doesn't work with Bun (can't load extensions),
+ * we use our own BunVSS implementation.
  */
 
 import { randomUUID } from "crypto";
 import { createHash } from "crypto";
 import { Database } from "bun:sqlite";
-import * as sqlite_vss from "sqlite-vss";
+import { BunVSS, HNSWIndex, createBunVSS } from "./bun-vss";
 import type { 
   VectorConfig, 
   VectorSearchResult, 
@@ -58,34 +59,27 @@ interface ChunkWithDocument extends ChunkRow {
 // ============================================
 
 /**
- * SQLite-based vector storage for RAG with sqlite-vss extension
+ * SQLite-based vector storage for RAG with Bun-native vector search
  */
 export class VectorStorage {
   private db: Database;
   private config: VectorConfig;
-  private initialized = false;
-  private dimensions: number;
-  
+  private initialized: boolean = false;
+  private bunVSS: BunVSS | null = null;
+  private hnswIndex: HNSWIndex | null = null;
+  private useHNSW: boolean = false;
+
   constructor(db: Database, config: VectorConfig) {
     this.db = db;
     this.config = config;
-    this.dimensions = config.dimensions || 1536;
   }
-  
+
   /**
-   * Initialize storage tables and VSS extension
+   * Initialize storage tables and vector index
    */
   async init(): Promise<void> {
     if (this.initialized) return;
-    
-    // Load sqlite-vss extension
-    try {
-      sqlite_vss.load(this.db);
-      console.log("[RAG] sqlite-vss extension loaded");
-    } catch (error) {
-      console.warn("[RAG] Failed to load sqlite-vss extension, falling back to JSON storage:", error);
-    }
-    
+
     // Create documents table
     this.db.run(`
       CREATE TABLE IF NOT EXISTS rag_documents (
@@ -99,10 +93,10 @@ export class VectorStorage {
         metadata TEXT,
         status TEXT DEFAULT 'pending',
         error TEXT,
-        ingested_at INTEGER NOT NULL
+        ingested_at INTEGER
       )
     `);
-    
+
     // Create chunks table
     this.db.run(`
       CREATE TABLE IF NOT EXISTS rag_chunks (
@@ -115,97 +109,72 @@ export class VectorStorage {
         embedding TEXT,
         embedding_model TEXT,
         metadata TEXT,
-        created_at INTEGER NOT NULL,
+        created_at INTEGER,
         FOREIGN KEY (document_id) REFERENCES rag_documents(id) ON DELETE CASCADE
       )
     `);
-    
-    // Create VSS virtual table for vector search
-    this.db.run(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_vss USING vss0(
-        embedding(${this.dimensions})
-      )
-    `);
-    
-    // Create mapping table for VSS
-    this.db.run(`
-      CREATE TABLE IF NOT EXISTS rag_chunks_vss_map (
-        chunk_id TEXT PRIMARY KEY,
-        embedding_id INTEGER NOT NULL,
-        FOREIGN KEY (chunk_id) REFERENCES rag_chunks(id) ON DELETE CASCADE
-      )
-    `);
-    
-    // Create FTS table for keyword search
-    this.db.run(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
-        content,
-        content='rag_chunks',
-        content_rowid='rowid'
-      )
-    `);
-    
+
+    // Create FTS5 virtual table for full-text search
+    try {
+      this.db.run(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts 
+        USING fts5(id, content, content='rag_chunks')
+      `);
+      
+      // Create triggers to keep FTS in sync
+      this.db.run(`
+        CREATE TRIGGER IF NOT EXISTS rag_chunks_ai AFTER INSERT ON rag_chunks BEGIN
+          INSERT INTO rag_chunks_fts(rowid, id, content) 
+          VALUES (new.rowid, new.id, new.content);
+        END
+      `);
+      
+      this.db.run(`
+        CREATE TRIGGER IF NOT EXISTS rag_chunks_ad AFTER DELETE ON rag_chunks BEGIN
+          INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, id, content) 
+          VALUES('delete', old.rowid, old.id, old.content);
+        END
+      `);
+      
+      this.db.run(`
+        CREATE TRIGGER IF NOT EXISTS rag_chunks_au AFTER UPDATE ON rag_chunks BEGIN
+          INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, id, content) 
+          VALUES('delete', old.rowid, old.id, old.content);
+          INSERT INTO rag_chunks_fts(rowid, id, content) 
+          VALUES (new.rowid, new.id, new.content);
+        END
+      `);
+    } catch {
+      // FTS5 might fail, that's okay
+    }
+
     // Create indexes
-    this.db.run(`
-      CREATE INDEX IF NOT EXISTS idx_rag_documents_gateway 
-      ON rag_documents(gateway_id)
-    `);
-    
-    this.db.run(`
-      CREATE INDEX IF NOT EXISTS idx_rag_chunks_document 
-      ON rag_chunks(document_id)
-    `);
-    
-    this.db.run(`
-      CREATE INDEX IF NOT EXISTS idx_rag_documents_hash 
-      ON rag_documents(content_hash)
-    `);
-    
-    // Create triggers for FTS sync
-    this.db.run(`
-      CREATE TRIGGER IF NOT EXISTS rag_chunks_ai AFTER INSERT ON rag_chunks BEGIN
-        INSERT INTO rag_chunks_fts(rowid, content) 
-        VALUES (new.rowid, new.content);
-      END
-    `);
-    
-    this.db.run(`
-      CREATE TRIGGER IF NOT EXISTS rag_chunks_ad AFTER DELETE ON rag_chunks BEGIN
-        INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, content) 
-        VALUES('delete', old.rowid, old.content);
-      END
-    `);
-    
-    this.db.run(`
-      CREATE TRIGGER IF NOT EXISTS rag_chunks_au AFTER UPDATE ON rag_chunks BEGIN
-        INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, content) 
-        VALUES('delete', old.rowid, old.content);
-        INSERT INTO rag_chunks_fts(rowid, content) 
-        VALUES (new.rowid, new.content);
-      END
-    `);
-    
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_chunks_document ON rag_chunks(document_id)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_documents_gateway ON rag_documents(gateway_id)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON rag_documents(content_hash)`);
+
+    // Initialize BunVSS for vector storage
+    try {
+      this.bunVSS = createBunVSS(this.db, {
+        dimension: this.config.dimensions || 1536,
+        metric: this.config.metric || "cosine",
+      });
+    } catch (error) {
+      console.warn("[RAG] Failed to initialize BunVSS, using in-memory HNSW:", error);
+      this.hnswIndex = new HNSWIndex({
+        dimension: this.config.dimensions || 1536,
+        metric: this.config.metric || "cosine",
+      });
+      this.useHNSW = true;
+    }
+
     this.initialized = true;
   }
-  
-  /**
-   * Check if VSS extension is available
-   */
-  private isVSSAvailable(): boolean {
-    try {
-      const result = this.db.query<{ vss_version: string }, []>(`
-        SELECT vss_version() as vss_version
-      `).get();
-      return !!result?.vss_version;
-    } catch {
-      return false;
-    }
-  }
-  
+
   // ============================================
   // Document Operations
   // ============================================
-  
+
   /**
    * Store a document
    */
@@ -238,16 +207,17 @@ export class VectorStorage {
       now,
     ]);
   }
-  
+
   /**
    * Get document by ID
    */
   async getDocument(id: string): Promise<DocumentRow | null> {
-    return this.db.query<DocumentRow, [string]>(`
+    const row = this.db.prepare(`
       SELECT * FROM rag_documents WHERE id = ? LIMIT 1
     `).get(id);
+    return row as DocumentRow | null;
   }
-  
+
   /**
    * List documents
    */
@@ -260,56 +230,61 @@ export class VectorStorage {
     const offset = options?.offset || 0;
     
     if (options?.gatewayId) {
-      return this.db.query<DocumentRow, [string, number, number]>(`
+      return this.db.prepare(`
         SELECT * FROM rag_documents 
         WHERE gateway_id = ?
         ORDER BY ingested_at DESC
         LIMIT ? OFFSET ?
-      `).all(options.gatewayId, limit, offset);
+      `).all(options.gatewayId, limit, offset) as DocumentRow[];
     }
     
-    return this.db.query<DocumentRow, [number, number]>(`
+    return this.db.prepare(`
       SELECT * FROM rag_documents 
       ORDER BY ingested_at DESC
       LIMIT ? OFFSET ?
-    `).all(limit, offset);
+    `).all(limit, offset) as DocumentRow[];
   }
-  
+
   /**
    * Delete document and its chunks
    */
   async deleteDocument(id: string): Promise<void> {
-    // Get chunk IDs first for VSS cleanup
-    const chunks = this.db.query<{ id: string }, [string]>(`
+    // Get chunk IDs first for vector cleanup
+    const chunks = this.db.prepare(`
       SELECT id FROM rag_chunks WHERE document_id = ?
-    `).all(id);
+    `).all(id) as { id: string }[];
     
-    // Delete from VSS mapping and table
+    // Delete from vector index
     for (const chunk of chunks) {
-      this.deleteChunkVSS(chunk.id);
+      if (this.bunVSS) {
+        this.bunVSS.delete(chunk.id);
+      } else if (this.hnswIndex) {
+        this.hnswIndex.delete(chunk.id);
+      }
     }
     
-    // Delete chunks (cascade should handle this, but be explicit)
+    // Delete chunks
     this.db.run(`DELETE FROM rag_chunks WHERE document_id = ?`, [id]);
     // Delete document
     this.db.run(`DELETE FROM rag_documents WHERE id = ?`, [id]);
   }
-  
+
   /**
    * Check if document exists by hash
    */
   async documentExistsByHash(contentHash: string): Promise<DocumentRow | null> {
-    return this.db.query<DocumentRow, [string]>(`
+    const row = this.db.prepare(`
       SELECT * FROM rag_documents WHERE content_hash = ? LIMIT 1
     `).get(contentHash);
+    return row as DocumentRow | null;
   }
-  
+
   // ============================================
   // Chunk Operations
   // ============================================
-  
+
   /**
-   * Store a chunk with VSS indexing
+   * Store a chunk with vector indexing
    */
   async storeChunk(chunk: TextChunk): Promise<void> {
     // Insert chunk
@@ -331,14 +306,24 @@ export class VectorStorage {
       chunk.createdAt.getTime(),
     ]);
     
-    // Add to VSS index if embedding exists
-    if (chunk.embedding && this.isVSSAvailable()) {
-      this.addToVSSIndex(chunk.id, chunk.embedding);
+    // Add to vector index if embedding exists
+    if (chunk.embedding) {
+      if (this.bunVSS) {
+        this.bunVSS.insert(chunk.id, chunk.embedding, {
+          documentId: chunk.documentId,
+          content: chunk.content,
+        });
+      } else if (this.hnswIndex) {
+        this.hnswIndex.insert(chunk.id, chunk.embedding, {
+          documentId: chunk.documentId,
+          content: chunk.content,
+        });
+      }
     }
   }
-  
+
   /**
-   * Store multiple chunks with VSS indexing
+   * Store multiple chunks with vector indexing
    */
   async storeChunks(chunks: TextChunk[]): Promise<void> {
     const stmt = this.db.prepare(`
@@ -363,27 +348,37 @@ export class VectorStorage {
           chunk.createdAt.getTime()
         );
         
-        // Add to VSS index if embedding exists
-        if (chunk.embedding && this.isVSSAvailable()) {
-          this.addToVSSIndex(chunk.id, chunk.embedding);
+        // Add to vector index if embedding exists
+        if (chunk.embedding) {
+          if (this.bunVSS) {
+            this.bunVSS.insert(chunk.id, chunk.embedding, {
+              documentId: chunk.documentId,
+              content: chunk.content,
+            });
+          } else if (this.hnswIndex) {
+            this.hnswIndex.insert(chunk.id, chunk.embedding, {
+              documentId: chunk.documentId,
+              content: chunk.content,
+            });
+          }
         }
       }
     });
     
     insertMany(chunks);
   }
-  
+
   /**
    * Get chunks for a document
    */
   async getChunks(documentId: string): Promise<ChunkRow[]> {
-    return this.db.query<ChunkRow, [string]>(`
+    return this.db.prepare(`
       SELECT * FROM rag_chunks 
       WHERE document_id = ? 
       ORDER BY chunk_index ASC
-    `).all(documentId);
+    `).all(documentId) as ChunkRow[];
   }
-  
+
   /**
    * Update chunk embedding
    */
@@ -397,444 +392,114 @@ export class VectorStorage {
       SET embedding = ?, embedding_model = ?
       WHERE id = ?
     `, [JSON.stringify(embedding), model, chunkId]);
+
+    // Update vector index
+    const chunk = this.db.prepare(`
+      SELECT * FROM rag_chunks WHERE id = ?
+    `).get(chunkId) as ChunkRow | undefined;
     
-    // Update VSS index
-    if (this.isVSSAvailable()) {
-      // Delete old VSS entry
-      this.deleteChunkVSS(chunkId);
-      // Add new VSS entry
-      this.addToVSSIndex(chunkId, embedding);
-    }
-  }
-  
-  // ============================================
-  // VSS Operations
-  // ============================================
-  
-  /**
-   * Add chunk to VSS index
-   */
-  private addToVSSIndex(chunkId: string, embedding: number[]): void {
-    if (!this.isVSSAvailable()) return;
-    
-    try {
-      // Insert into VSS table
-      const result = this.db.run(`
-        INSERT INTO rag_chunks_vss (embedding) VALUES (vss_vector(?))
-      `, [JSON.stringify(embedding)]);
-      
-      const embeddingId = result.lastInsertRowid;
-      
-      // Store mapping
-      this.db.run(`
-        INSERT INTO rag_chunks_vss_map (chunk_id, embedding_id) VALUES (?, ?)
-      `, [chunkId, embeddingId]);
-    } catch (error) {
-      console.error("[RAG] Failed to add to VSS index:", error);
-    }
-  }
-  
-  /**
-   * Delete chunk from VSS index
-   */
-  private deleteChunkVSS(chunkId: string): void {
-    if (!this.isVSSAvailable()) return;
-    
-    try {
-      // Get embedding ID
-      const mapping = this.db.query<{ embedding_id: number }, [string]>(`
-        SELECT embedding_id FROM rag_chunks_vss_map WHERE chunk_id = ?
-      `).get(chunkId);
-      
-      if (mapping) {
-        // Delete from VSS table
-        this.db.run(`DELETE FROM rag_chunks_vss WHERE rowid = ?`, [mapping.embedding_id]);
-        // Delete mapping
-        this.db.run(`DELETE FROM rag_chunks_vss_map WHERE chunk_id = ?`, [chunkId]);
+    if (chunk) {
+      if (this.bunVSS) {
+        this.bunVSS.insert(chunkId, embedding, {
+          documentId: chunk.document_id,
+          content: chunk.content,
+        });
+      } else if (this.hnswIndex) {
+        this.hnswIndex.insert(chunkId, embedding, {
+          documentId: chunk.document_id,
+          content: chunk.content,
+        });
       }
-    } catch (error) {
-      console.error("[RAG] Failed to delete from VSS index:", error);
     }
   }
-  
-  // ============================================
-  // Search Operations
-  // ============================================
-  
+
   /**
-   * Vector similarity search using VSS
+   * Get chunk by ID
+   */
+  async getChunk(id: string): Promise<ChunkRow | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM rag_chunks WHERE id = ? LIMIT 1
+    `).get(id);
+    return row as ChunkRow | null;
+  }
+
+  // ============================================
+  // Vector Search Operations
+  // ============================================
+
+  /**
+   * Vector similarity search
    */
   async vectorSearch(
     embedding: number[],
     options?: Partial<RetrievalConfig>
   ): Promise<VectorSearchResult[]> {
     const topK = options?.topK || 5;
-    const minScore = options?.minScore || 0.0;
-    const gatewayId = options?.gatewayId;
-    
-    // Try VSS search first
-    if (this.isVSSAvailable()) {
-      return this.vssSearch(embedding, topK, minScore, gatewayId);
-    }
-    
-    // Fallback to JSON-based search
-    return this.jsonVectorSearch(embedding, topK, minScore, gatewayId);
-  }
-  
-  /**
-   * VSS-based vector search
-   */
-  private async vssSearch(
-    embedding: number[],
-    topK: number,
-    minScore: number,
-    gatewayId?: string
-  ): Promise<VectorSearchResult[]> {
-    try {
-      interface VSSSearchRow {
-        chunk_id: string;
-        distance: number;
-      }
-      
-      let query: string;
-      let params: (string | number)[];
-      
-      if (gatewayId) {
-        query = `
-          SELECT m.chunk_id, v.distance
-          FROM rag_chunks_vss v
-          JOIN rag_chunks_vss_map m ON v.rowid = m.embedding_id
-          JOIN rag_chunks c ON c.id = m.chunk_id
-          JOIN rag_documents d ON c.document_id = d.id
-          WHERE vss_search(v.embedding, vss_vector(?)) AND d.gateway_id = ?
-          ORDER BY v.distance ASC
-          LIMIT ?
-        `;
-        params = [JSON.stringify(embedding), gatewayId, topK];
-      } else {
-        query = `
-          SELECT m.chunk_id, v.distance
-          FROM rag_chunks_vss v
-          JOIN rag_chunks_vss_map m ON v.rowid = m.embedding_id
-          WHERE vss_search(v.embedding, vss_vector(?))
-          ORDER BY v.distance ASC
-          LIMIT ?
-        `;
-        params = [JSON.stringify(embedding), topK];
-      }
-      
-      const vssResults = this.db.query<VSSSearchRow, typeof params>(query).all(...params);
-      
-      // Get chunk details and convert distances to scores
-      const results: VectorSearchResult[] = [];
-      
-      for (const vssResult of vssResults) {
-        // Convert distance to similarity score (0-1)
-        // VSS uses cosine distance by default, so similarity = 1 - distance
-        const score = Math.max(0, 1 - vssResult.distance);
-        
-        if (score >= minScore) {
-          const chunk = this.db.query<ChunkWithDocument, [string]>(`
-            SELECT c.*, d.gateway_id as doc_gateway_id, d.source as doc_source, d.title as doc_title
-            FROM rag_chunks c
-            JOIN rag_documents d ON c.document_id = d.id
-            WHERE c.id = ?
-          `).get(vssResult.chunk_id);
-          
-          if (chunk) {
-            results.push({
-              chunkId: chunk.id,
-              documentId: chunk.document_id,
-              content: chunk.content,
-              score,
-              metadata: {
-                index: chunk.chunk_index,
-                source: chunk.doc_source,
-                title: chunk.doc_title,
-                ...(chunk.metadata ? JSON.parse(chunk.metadata) : {}),
-              },
-            });
-          }
-        }
-      }
-      
-      return results;
-    } catch (error) {
-      console.error("[RAG] VSS search failed, falling back to JSON search:", error);
-      return this.jsonVectorSearch(embedding, topK, minScore, gatewayId);
-    }
-  }
-  
-  /**
-   * JSON-based vector search (fallback)
-   */
-  private async jsonVectorSearch(
-    embedding: number[],
-    topK: number,
-    minScore: number,
-    gatewayId?: string
-  ): Promise<VectorSearchResult[]> {
-    // Get all chunks with embeddings
-    let query: string;
-    let params: (string | null)[];
-    
-    if (gatewayId) {
-      query = `
-        SELECT c.*, d.gateway_id as doc_gateway_id, d.source as doc_source, d.title as doc_title
-        FROM rag_chunks c
-        JOIN rag_documents d ON c.document_id = d.id
-        WHERE c.embedding IS NOT NULL AND d.gateway_id = ?
-        ORDER BY c.chunk_index ASC
-      `;
-      params = [gatewayId];
+    const threshold = 0; // Minimum similarity threshold
+
+    let results: Array<{ id: string; score: number; metadata?: Record<string, unknown> }>;
+
+    if (this.bunVSS) {
+      results = this.bunVSS.search(embedding, topK);
+    } else if (this.hnswIndex) {
+      results = this.hnswIndex.search(embedding, topK);
     } else {
-      query = `
-        SELECT c.*, d.gateway_id as doc_gateway_id, d.source as doc_source, d.title as doc_title
-        FROM rag_chunks c
-        JOIN rag_documents d ON c.document_id = d.id
-        WHERE c.embedding IS NOT NULL
-        ORDER BY c.chunk_index ASC
-      `;
-      params = [];
+      // Fallback: brute force search from database
+      results = await this.bruteForceSearch(embedding, topK);
     }
+
+    // Filter by threshold and enrich with chunk data
+    const searchResults: VectorSearchResult[] = [];
     
-    const rows = this.db.query<ChunkWithDocument, typeof params>(query).all(...params);
-    
-    // Calculate similarities
-    const results: VectorSearchResult[] = [];
-    
-    for (const row of rows) {
-      if (!row.embedding) continue;
+    for (const result of results) {
+      if (result.score < threshold) continue;
       
+      const chunk = await this.getChunk(result.id);
+      if (!chunk) continue;
+
+      searchResults.push({
+        chunkId: chunk.id,
+        documentId: chunk.document_id,
+        content: chunk.content,
+        score: result.score,
+        metadata: chunk.metadata ? JSON.parse(chunk.metadata) : undefined,
+      });
+    }
+
+    return searchResults;
+  }
+
+  /**
+   * Brute force vector search (fallback)
+   */
+  private async bruteForceSearch(
+    queryEmbedding: number[], 
+    topK: number
+  ): Promise<Array<{ id: string; score: number; metadata?: Record<string, unknown> }>> {
+    const chunks = this.db.prepare(`
+      SELECT id, embedding FROM rag_chunks WHERE embedding IS NOT NULL
+    `).all() as { id: string; embedding: string }[];
+
+    const results: Array<{ id: string; score: number }> = [];
+
+    for (const chunk of chunks) {
       try {
-        const chunkEmbedding = JSON.parse(row.embedding) as number[];
-        const score = this.cosineSimilarity(embedding, chunkEmbedding);
-        
-        if (score >= minScore) {
-          results.push({
-            chunkId: row.id,
-            documentId: row.document_id,
-            content: row.content,
-            score,
-            metadata: {
-              index: row.chunk_index,
-              source: row.doc_source,
-              title: row.doc_title,
-              ...(row.metadata ? JSON.parse(row.metadata) : {}),
-            },
-          });
-        }
+        const embedding = JSON.parse(chunk.embedding) as number[];
+        const score = this.cosineSimilarity(queryEmbedding, embedding);
+        results.push({ id: chunk.id, score });
       } catch {
         // Skip invalid embeddings
       }
     }
-    
-    // Sort by score and return top K
-    return results
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, topK);
   }
-  
+
   /**
-   * Keyword search using FTS
-   */
-  async keywordSearch(
-    query: string,
-    options?: Partial<RetrievalConfig>
-  ): Promise<VectorSearchResult[]> {
-    const topK = options?.topK || 5;
-    const gatewayId = options?.gatewayId;
-    
-    // Use FTS5 for keyword search
-    let sql: string;
-    let params: (string | number | null)[];
-    
-    if (gatewayId) {
-      sql = `
-        SELECT c.id, c.document_id, c.content, c.chunk_index, 
-               c.metadata, d.gateway_id, d.source, d.title,
-               bm25(rag_chunks_fts) as score
-        FROM rag_chunks_fts fts
-        JOIN rag_chunks c ON c.rowid = fts.rowid
-        JOIN rag_documents d ON c.document_id = d.id
-        WHERE rag_chunks_fts MATCH ? AND d.gateway_id = ?
-        ORDER BY score
-        LIMIT ?
-      `;
-      params = [query, gatewayId, topK];
-    } else {
-      sql = `
-        SELECT c.id, c.document_id, c.content, c.chunk_index,
-               c.metadata, d.gateway_id, d.source, d.title,
-               bm25(rag_chunks_fts) as score
-        FROM rag_chunks_fts fts
-        JOIN rag_chunks c ON c.rowid = fts.rowid
-        JOIN rag_documents d ON c.document_id = d.id
-        WHERE rag_chunks_fts MATCH ?
-        ORDER BY score
-        LIMIT ?
-      `;
-      params = [query, topK];
-    }
-    
-    interface KeywordSearchRow {
-      id: string;
-      document_id: string;
-      content: string;
-      chunk_index: number;
-      metadata: string | null;
-      gateway_id: string | null;
-      source: string | null;
-      title: string | null;
-      score: number;
-    }
-    
-    const rows = this.db.query<KeywordSearchRow, typeof params>(sql).all(...params);
-    
-    // Normalize BM25 scores to 0-1 range
-    const maxScore = Math.max(...rows.map(r => Math.abs(r.score)), 1);
-    
-    return rows.map(row => ({
-      chunkId: row.id,
-      documentId: row.document_id,
-      content: row.content,
-      score: 1 - (Math.abs(row.score) / maxScore), // Invert and normalize
-      metadata: {
-        index: row.chunk_index,
-        source: row.source,
-        title: row.title,
-        ...(row.metadata ? JSON.parse(row.metadata) : {}),
-      },
-    }));
-  }
-  
-  /**
-   * Hybrid search combining vector and keyword
-   */
-  async hybridSearch(
-    embedding: number[],
-    query: string,
-    options?: Partial<RetrievalConfig>
-  ): Promise<VectorSearchResult[]> {
-    const vectorWeight = options?.vectorWeight || 0.7;
-    const keywordWeight = options?.keywordWeight || 0.3;
-    const topK = options?.topK || 5;
-    
-    // Run both searches
-    const [vectorResults, keywordResults] = await Promise.all([
-      this.vectorSearch(embedding, { ...options, topK: topK * 3 }),
-      this.keywordSearch(query, { ...options, topK: topK * 3 }),
-    ]);
-    
-    // Merge results with weighted scoring
-    const merged = new Map<string, VectorSearchResult>();
-    
-    // Add vector results
-    for (const result of vectorResults) {
-      merged.set(result.chunkId, {
-        ...result,
-        score: result.score * vectorWeight,
-      });
-    }
-    
-    // Add/merge keyword results
-    for (const result of keywordResults) {
-      const existing = merged.get(result.chunkId);
-      if (existing) {
-        existing.score += result.score * keywordWeight;
-      } else {
-        merged.set(result.chunkId, {
-          ...result,
-          score: result.score * keywordWeight,
-        });
-      }
-    }
-    
-    // Sort by combined score and return top K
-    return Array.from(merged.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
-  }
-  
-  // ============================================
-  // Statistics
-  // ============================================
-  
-  /**
-   * Get storage statistics
-   */
-  async getStats(): Promise<{
-    totalDocuments: number;
-    totalChunks: number;
-    totalEmbeddings: number;
-    avgChunkSize: number;
-    storageSize: number;
-    vssAvailable: boolean;
-  }> {
-    const docCount = this.db.query<{ count: number }, []>(`
-      SELECT COUNT(*) as count FROM rag_documents
-    `).get();
-    
-    const chunkStats = this.db.query<{
-      count: number;
-      embedding_count: number;
-      avg_size: number;
-    }, []>(`
-      SELECT 
-        COUNT(*) as count,
-        SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) as embedding_count,
-        AVG(LENGTH(content)) as avg_size
-      FROM rag_chunks
-    `).get();
-    
-    // Estimate storage size
-    const dbSize = this.db.query<{ size: number }, []>(`
-      SELECT SUM(LENGTH(content) + COALESCE(LENGTH(embedding), 0)) as size
-      FROM rag_chunks
-    `).get();
-    
-    return {
-      totalDocuments: docCount?.count || 0,
-      totalChunks: chunkStats?.count || 0,
-      totalEmbeddings: chunkStats?.embedding_count || 0,
-      avgChunkSize: Math.round(chunkStats?.avg_size || 0),
-      storageSize: dbSize?.size || 0,
-      vssAvailable: this.isVSSAvailable(),
-    };
-  }
-  
-  /**
-   * Clear all data
-   */
-  async clear(): Promise<void> {
-    // Clear VSS data first
-    if (this.isVSSAvailable()) {
-      this.db.run(`DELETE FROM rag_chunks_vss`);
-      this.db.run(`DELETE FROM rag_chunks_vss_map`);
-    }
-    
-    this.db.run(`DELETE FROM rag_chunks`);
-    this.db.run(`DELETE FROM rag_documents`);
-  }
-  
-  /**
-   * Dispose resources
-   */
-  async dispose(): Promise<void> {
-    // Nothing to dispose for SQLite
-    this.initialized = false;
-  }
-  
-  // ============================================
-  // Private Helpers
-  // ============================================
-  
-  /**
-   * Calculate cosine similarity between two vectors
+   * Compute cosine similarity
    */
   private cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length) return 0;
-    
     let dotProduct = 0;
     let normA = 0;
     let normB = 0;
@@ -845,17 +510,140 @@ export class VectorStorage {
       normB += b[i] * b[i];
     }
     
-    const denominator = Math.sqrt(normA) * Math.sqrt(normB);
-    return denominator === 0 ? 0 : dotProduct / denominator;
+    normA = Math.sqrt(normA);
+    normB = Math.sqrt(normB);
+    
+    if (normA === 0 || normB === 0) return 0;
+    return dotProduct / (normA * normB);
+  }
+
+  /**
+   * Hybrid search (vector + keyword)
+   */
+  async hybridSearch(
+    embedding: number[],
+    query: string,
+    options?: Partial<RetrievalConfig>
+  ): Promise<VectorSearchResult[]> {
+    const topK = options?.topK || 5;
+    const alpha = 0.5; // Weight for vector vs keyword (0.5 = equal weight)
+
+    // Get vector search results
+    const vectorResults = await this.vectorSearch(embedding, { topK: topK * 2 });
+
+    // Get keyword search results
+    let keywordResults: Array<{ chunkId: string; score: number }> = [];
+    try {
+      const ftsResults = this.db.prepare(`
+        SELECT id as chunkId, bm25(rag_chunks_fts) as score
+        FROM rag_chunks_fts
+        WHERE rag_chunks_fts MATCH ?
+        ORDER BY score DESC
+        LIMIT ?
+      `).all(query, topK * 2) as { chunkId: string; score: number }[];
+      
+      keywordResults = ftsResults.map(r => ({
+        chunkId: r.chunkId,
+        score: Math.abs(r.score), // BM25 can be negative
+      }));
+    } catch {
+      // FTS might fail, continue with vector only
+    }
+
+    // Combine scores using Reciprocal Rank Fusion
+    const combinedScores = new Map<string, number>();
+    
+    for (let i = 0; i < vectorResults.length; i++) {
+      const result = vectorResults[i];
+      const rrf = 1 / (60 + i + 1);
+      combinedScores.set(result.chunkId, alpha * rrf);
+    }
+    
+    for (let i = 0; i < keywordResults.length; i++) {
+      const result = keywordResults[i];
+      const existing = combinedScores.get(result.chunkId) || 0;
+      const rrf = 1 / (60 + i + 1);
+      combinedScores.set(result.chunkId, existing + (1 - alpha) * rrf);
+    }
+
+    // Sort by combined score
+    const sorted = Array.from(combinedScores.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, topK);
+
+    // Enrich with chunk data
+    const results: VectorSearchResult[] = [];
+    for (const [chunkId, score] of sorted) {
+      const chunk = await this.getChunk(chunkId);
+      if (chunk) {
+        results.push({
+          chunkId: chunk.id,
+          documentId: chunk.document_id,
+          content: chunk.content,
+          score,
+          metadata: chunk.metadata ? JSON.parse(chunk.metadata) : undefined,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  // ============================================
+  // Statistics and Management
+  // ============================================
+
+  /**
+   * Get storage statistics
+   */
+  async getStats(): Promise<{
+    documents: number;
+    chunks: number;
+    embeddedChunks: number;
+    vectorIndexSize: number;
+  }> {
+    const docCount = this.db.prepare(`SELECT COUNT(*) as count FROM rag_documents`).get() as { count: number };
+    const chunkCount = this.db.prepare(`SELECT COUNT(*) as count FROM rag_chunks`).get() as { count: number };
+    const embeddedCount = this.db.prepare(`
+      SELECT COUNT(*) as count FROM rag_chunks WHERE embedding IS NOT NULL
+    `).get() as { count: number };
+
+    let vectorIndexSize = 0;
+    if (this.bunVSS) {
+      vectorIndexSize = this.bunVSS.count();
+    } else if (this.hnswIndex) {
+      vectorIndexSize = this.hnswIndex.count();
+    }
+
+    return {
+      documents: docCount.count,
+      chunks: chunkCount.count,
+      embeddedChunks: embeddedCount.count,
+      vectorIndexSize,
+    };
+  }
+
+  /**
+   * Clear all data
+   */
+  async clear(): Promise<void> {
+    this.db.run(`DELETE FROM rag_chunks`);
+    this.db.run(`DELETE FROM rag_documents`);
+    
+    if (this.bunVSS) {
+      this.bunVSS.clear();
+    } else if (this.hnswIndex) {
+      this.hnswIndex.clear();
+    }
   }
 }
 
 // ============================================
-// Utility Functions
+// Helper Functions
 // ============================================
 
 /**
- * Create content hash
+ * Generate content hash
  */
 export function hashContent(content: string): string {
   return createHash("sha256").update(content).digest("hex");
@@ -867,3 +655,13 @@ export function hashContent(content: string): string {
 export function generateId(): string {
   return randomUUID();
 }
+
+/**
+ * Create vector storage instance
+ */
+export function createVectorStorage(db: Database, config: VectorConfig): VectorStorage {
+  const storage = new VectorStorage(db, config);
+  return storage;
+}
+
+export default VectorStorage;

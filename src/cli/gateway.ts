@@ -17,11 +17,13 @@ import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 
-// Directory paths
-const KENDALIAI_DIR = join(process.env.HOME || "", ".kendaliai");
+// Directory paths - use project-local directory by default
+const PROJECT_DIR = process.cwd();
+const KENDALIAI_DIR = join(PROJECT_DIR, ".kendaliai");
 const GATEWAYS_DIR = join(KENDALIAI_DIR, "gateways");
 const RUN_DIR = join(KENDALIAI_DIR, "run");
 const LOGS_DIR = join(KENDALIAI_DIR, "logs");
+const DATA_DIR = join(KENDALIAI_DIR, "data");
 
 // Regex for valid gateway names: alphanumeric, underscores, hyphens only
 const GATEWAY_NAME_REGEX = /^[a-zA-Z0-9_-]+$/;
@@ -266,17 +268,15 @@ export async function startGateway(
       }
     }
     
-    // Start the process using Bun.spawn
+    // Start the process using Bun.spawn - run the server directly
     const child = Bun.spawn(
-      ["bun", "run", "src/cli.ts", "gateway", "--port", port.toString(), "--host", host, "--gateway-name", name],
+      ["bun", "run", "src/server/index.ts", "--port", port.toString(), "--host", host],
       {
-        detached: true,
-        stdio: ["ignore", "ignore", "ignore"],
+        stdout: "inherit",
+        stderr: "inherit",
         cwd: process.cwd(),
       }
     );
-    
-    child.unref();
     
     // Get PID
     const pid = child.pid;
@@ -302,18 +302,57 @@ export async function startGateway(
     console.log(`🚀 Gateway '${name}' started as daemon (PID: ${child.pid}, Port: ${port})`);
     console.log(`   Logs: ${logFile}`);
   } else {
-    // Start in foreground (would need the main server to handle this)
+    // Start in foreground
     console.log(`Starting gateway '${name}' in foreground...`);
     console.log(`   Port: ${port}, Host: ${host}`);
     
+    // Start the process using Bun.spawn
+    const child = Bun.spawn(
+      ["bun", "run", "src/server/index.ts", "--port", port.toString(), "--host", host],
+      {
+        stdout: "inherit",
+        stderr: "inherit",
+        stdin: "inherit",
+        cwd: process.cwd(),
+      }
+    );
+    
+    console.log(`   PID:  ${child.pid}`);
+    
+    // Update database
     db.run(`
       UPDATE gateways SET 
         status = 'running', 
+        daemon_enabled = 0,
+        daemon_pid = ?,
         daemon_port = ?,
         started_at = ?,
         updated_at = ?
       WHERE id = ?
-    `, [port, Date.now(), Date.now(), gateway.id]);
+    `, [child.pid, port, Date.now(), Date.now(), gateway.id]);
+
+    // Handle signals to ensure clean up
+    const cleanup = () => {
+      db.run(`UPDATE gateways SET status = 'stopped', daemon_pid = NULL WHERE id = ?`, [gateway.id]);
+      child.kill();
+    };
+
+    process.on("SIGINT", cleanup);
+    process.on("SIGTERM", cleanup);
+
+    // Wait for the process to exit
+    await child.exited;
+    
+    // Update database when finished
+    db.run(`
+      UPDATE gateways SET 
+        status = 'stopped', 
+        daemon_pid = NULL,
+        updated_at = ?
+      WHERE id = ?
+    `, [Date.now(), gateway.id]);
+    
+    console.log(`\n✅ Gateway '${name}' stopped`);
   }
 }
 
@@ -339,8 +378,12 @@ export function stopGateway(db: Database, name: string, force: boolean = false):
     try {
       process.kill(gateway.daemon_pid, force ? "SIGKILL" : "SIGTERM");
       console.log(`Sent stop signal to gateway '${name}' (PID: ${gateway.daemon_pid})`);
-    } catch (error) {
-      console.log(`Warning: Could not kill process: ${error}`);
+    } catch (error: any) {
+      if (error.code === "ESRCH") {
+        // Process is already gone, this is fine
+      } else {
+        console.log(`Warning: Could not kill process: ${error}`);
+      }
     }
   }
   
@@ -513,11 +556,28 @@ export async function handleGatewayCommand(
       console.log("╠══════════════════════════════════════════════════════════════════════════╣");
       
       for (const gw of gateways) {
-        const status = gw.status === "running" ? "● Running" : "○ Stopped";
-        const pid = gw.daemon_pid || "-";
+        let currentStatus = gw.status;
+        let currentPid = gw.daemon_pid;
+
+        // Check if process is actually alive if marked as running
+        if (currentStatus === "running" && currentPid) {
+          try {
+            process.kill(currentPid, 0);
+          } catch (e) {
+            // Process is not running
+            currentStatus = "stopped";
+            currentPid = null;
+            
+            // Update database for stale status
+            db.run(`UPDATE gateways SET status = 'stopped', daemon_pid = NULL WHERE id = ?`, [gw.id]);
+          }
+        }
+
+        const statusText = currentStatus === "running" ? "● Running" : "○ Stopped";
+        const pidText = currentPid || "-";
         const model = gw.default_model || "-";
         const port = gw.daemon_port || "-";
-        console.log(`║ ${gw.name.padEnd(14)} ${status.padEnd(9)} ${String(pid).padEnd(7)} ${gw.provider.padEnd(10)} ${model.padEnd(16)} ${String(port).padEnd(9)}║`);
+        console.log(`║ ${gw.name.padEnd(14)} ${statusText.padEnd(9)} ${String(pidText).padEnd(7)} ${gw.provider.padEnd(10)} ${model.padEnd(16)} ${String(port).padEnd(9)}║`);
       }
       
       console.log("╚══════════════════════════════════════════════════════════════════════════╝");

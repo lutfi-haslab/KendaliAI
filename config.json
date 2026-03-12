@@ -1,0 +1,7 @@
+{
+  "database": {
+    "path": "./.kendaliai/data/kendaliai.db"
+  },
+  "gateways": [],
+  "defaultProvider": "deepseek"
+}

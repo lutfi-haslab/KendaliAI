@@ -8,57 +8,41 @@
 
 // Core imports
 import { configLoader } from "./config";
-import { dbManager } from "./database";
+import { getDatabase, initDatabase, dbManager } from "./database";
 import { eventBus } from "./eventbus";
 import { log } from "./core";
 
-// Database schema and operations
+// Database schema
 import {
   messages,
-  workflows,
-  agents,
   gateways,
-  plugins,
   tools,
-  eventLogs,
-  users,
-  apiKeys,
-  tasks,
+  channels,
+  memories,
+  skills,
+  pairings,
 } from "./database/schema";
 import { desc, count, eq } from "drizzle-orm";
 
-// Agents
-import { agentManager } from "./agents/manager";
-import { Planner } from "./agents/planner";
-import { Executor } from "./agents/executor";
+// Providers
+import {
+  providerRegistry,
+  OpenAIProvider,
+  DeepSeekProvider,
+  ZAIProvider,
+  CustomProvider,
+} from "./providers";
+import type { AIProvider, GenerateOptions, StreamChunk } from "./providers";
 
 // Tools
 import { toolRegistry } from "./tools/registry";
-import { permissionManager } from "./tools/permissions";
 
-// Router
-import { intentRouter } from "./router/intent";
+// Routing
+import { RoutingManager } from "./routing";
 
-// Workflow
-import { workflowEngine } from "./workflow/engine";
-import { triggerSystem } from "./workflow/trigger";
-
-// Plugins
-import { pluginManager } from "./plugins";
-
-// Gateway
-import { gateway } from "./gateway/gateway";
-import { OpenAIProvider } from "./gateway/providers/openai";
-import { AnthropicProvider } from "./gateway/providers/anthropic";
-import { OllamaProvider } from "./gateway/providers/ollama";
-
-// Auth
-import { authManager } from "./auth/manager";
-import { authMiddleware } from "./auth/middleware";
-import type { AuthContext } from "./auth/types";
-
-// OpenAI Routes
-import { routeOpenAIRequest } from "./routes/openai";
+// RAG
+import { createRAGEngine } from "./rag";
+import type { RAGEngine } from "./rag";
 
 // ============================================
 // Types
@@ -66,13 +50,9 @@ import { routeOpenAIRequest } from "./routes/openai";
 
 interface StatsResponse {
   messages: number;
-  workflows: number;
-  agents: number;
-  plugins: number;
+  gateways: number;
   uptime: number;
   requests: number;
-  activeWorkflows: number;
-  agentTasks: number;
   systemLatency: number;
   recentActivity: any[];
 }
@@ -81,6 +61,32 @@ interface ApiResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
+}
+
+interface GatewayConfig {
+  id: string;
+  name: string;
+  description?: string;
+  provider: {
+    type: "openai" | "deepseek" | "zai" | "custom";
+    apiKey?: string;
+    model?: string;
+    endpoint?: string;
+  };
+  agent: {
+    name: string;
+    personality?: string;
+    instructions?: string;
+    traits?: string[];
+  };
+  skills?: string[];
+  tools?: string[];
+  channels?: Array<{
+    type: string;
+    config: Record<string, unknown>;
+  }>;
+  status: "stopped" | "running";
+  createdAt: string;
 }
 
 // ============================================
@@ -112,109 +118,78 @@ function error(message: string, status = 500): Response {
 }
 
 // ============================================
+// In-Memory Gateway Store
+// ============================================
+
+const gatewayInstances: Map<string, {
+  config: GatewayConfig;
+  provider: AIProvider;
+  status: "stopped" | "running";
+}> = new Map();
+
+// Routing manager instance (initialized in bootstrap)
+let routingManager: RoutingManager | null = null;
+
+// RAG engine instance (initialized in bootstrap)
+let ragEngineInstance: RAGEngine | null = null;
+
+// ============================================
 // Bootstrap Function
 // ============================================
 
 async function bootstrap() {
   log.info("Starting KendaliAI Server...");
 
+  // Initialize database
+  const db = initDatabase();
+  log.info("Database initialized successfully.");
+
+  // Get raw database for routing manager
+  const rawDb = dbManager.getRaw();
+  if (rawDb) {
+    routingManager = new RoutingManager(rawDb);
+    log.info("Routing manager initialized.");
+  }
+
   // Load configuration
   await configLoader.load();
   log.info("Configuration loaded.");
-
-  // Initialize database
-  if (dbManager.db) {
-    log.info("Database initialized successfully.");
-  }
-
-  // Register AI providers from config
-  const providers = configLoader.get().providers || {};
-
-  if (providers.openai?.apiKey) {
-    gateway.register(new OpenAIProvider(providers.openai));
-    log.info("OpenAI provider registered.");
-  }
-
-  if (providers.anthropic?.apiKey) {
-    gateway.register(new AnthropicProvider(providers.anthropic));
-    log.info("Anthropic provider registered.");
-  }
-
-  if (providers.ollama?.endpoint) {
-    gateway.register(new OllamaProvider(providers.ollama));
-    log.info("Ollama provider registered.");
-  }
 
   // Register built-in tools
   registerBuiltinTools();
   log.info("Built-in tools registered.");
 
-  // Register default agent
-  const defaultAgent = {
-    name: "core_agent",
-    run: async (task: string) => {
-      log.info(`[CoreAgent] Received task: ${task}`);
-      const plannerInstance = new Planner();
-      const executorInstance = new Executor();
-
-      const plan = await plannerInstance.createPlan(task);
-      await executorInstance.executePlan(plan);
-
-      return await gateway.chatCompletion({
-        model: "gpt-4o",
-        messages: [{ role: "user", content: `Summarize: ${task}` }],
-      });
-    },
-  };
-  agentManager.register("core_agent", defaultAgent);
-  log.info("Default agent registered.");
-
-  // Set up trigger system
-  triggerSystem.register("webhook", async (payload: unknown) => {
-    log.info("[Webhook Trigger] Firing workflow engine...");
-    // A full implementation would find workflows registered for this webhook ID
-    // and run them. For now, we skip running an empty temporary flow to avoid
-    // "No start nodes found" errors.
-  });
+  // Initialize RAG engine
+  try {
+    if (rawDb) {
+      ragEngineInstance = await createRAGEngine(rawDb, {});
+      log.info("RAG engine initialized.");
+    }
+  } catch (err) {
+    log.warn("RAG engine initialization skipped:", err);
+  }
 
   // Set up event handlers
-  eventBus.on(
-    "MESSAGE_RECEIVED",
-    async (payload: {
-      adapter?: string;
-      from?: string;
-      text?: string;
-      username?: string;
-      user?: string;
-    }) => {
-      log.info(
-        `EventBus routed message over ${payload.adapter}: ${payload.text}`,
-      );
-
-      await dbManager.db.insert(messages).values({
-        adapter: payload.adapter || "unknown",
-        sender: payload.from || payload.username || payload.user || "unknown",
-        payload: payload.text || "",
+  eventBus.on("MESSAGE_RECEIVED", async (payload: {
+    adapter?: string;
+    from?: string;
+    text?: string;
+    username?: string;
+    user?: string;
+  }) => {
+    log.info(`EventBus received message from ${payload.adapter}: ${payload.text}`);
+    
+    try {
+      await db.insert(messages).values({
+        gatewayId: null,
+        channelId: null,
+        role: "user",
+        content: payload.text || "",
+        senderId: payload.from || payload.username || payload.user || "unknown",
+        senderName: payload.username || payload.user || "unknown",
       });
-
-      await intentRouter.process(payload.text || "");
-    },
-  );
-
-  // Register intent handlers
-  intentRouter.register(
-    /^process\s+(.+)$/i,
-    async (matches: RegExpMatchArray) => {
-      const task = matches[1];
-      const result = await agentManager.delegate("core_agent", task);
-      log.info(`Handled process intent. Result: ${result}`);
-    },
-  );
-
-  intentRouter.register(/^ping$/i, async () => {
-    const result = await toolRegistry.execute("ping", {});
-    if (result === "pong") {
-      log.info("Ping successful - pong received");
+    } catch (err) {
+      log.error("Failed to save message:", err);
     }
   });
 
@@ -230,22 +205,22 @@ function registerBuiltinTools() {
   toolRegistry.register({
     name: "ping",
     description: "Replies with pong",
-    schema: { type: "object", properties: {} },
-    execute: async () => "pong",
+    parameters: { type: "object", properties: {} },
+    handler: async () => "pong",
   });
 
   // Echo tool
   toolRegistry.register({
     name: "echo",
     description: "Echoes back the input message",
-    schema: {
+    parameters: {
       type: "object",
       properties: {
         message: { type: "string", description: "Message to echo" },
       },
       required: ["message"],
     },
-    execute: async (params: Record<string, unknown>) =>
+    handler: async (params: Record<string, unknown>) =>
       `Echo: ${params.message}`,
   });
 
@@ -253,22 +228,22 @@ function registerBuiltinTools() {
   toolRegistry.register({
     name: "time",
     description: "Returns the current time",
-    schema: { type: "object", properties: {} },
-    execute: async () => new Date().toISOString(),
+    parameters: { type: "object", properties: {} },
+    handler: async () => new Date().toISOString(),
   });
 
   // Random tool
   toolRegistry.register({
     name: "random",
     description: "Returns a random number",
-    schema: {
+    parameters: {
       type: "object",
       properties: {
         min: { type: "number", description: "Minimum value" },
         max: { type: "number", description: "Maximum value" },
       },
     },
-    execute: async (params: Record<string, unknown>) => {
+    handler: async (params: Record<string, unknown>) => {
       const min = (params.min as number) ?? 0;
       const max = (params.max as number) ?? 100;
       return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -277,33 +252,60 @@ function registerBuiltinTools() {
 }
 
 // ============================================
+// Provider Factory
+// ============================================
+
+function createProvider(config: GatewayConfig["provider"]): AIProvider {
+  switch (config.type) {
+    case "openai":
+      return new OpenAIProvider({
+        type: "openai",
+        apiKey: config.apiKey,
+        defaultModel: config.model,
+      });
+    case "deepseek":
+      return new DeepSeekProvider({
+        type: "deepseek",
+        apiKey: config.apiKey,
+        defaultModel: config.model,
+      });
+    case "zai":
+      return new ZAIProvider({
+        type: "zai",
+        apiKey: config.apiKey,
+        defaultModel: config.model,
+      });
+    case "custom":
+      return new CustomProvider({
+        type: "custom",
+        baseURL: config.endpoint || "http://localhost:11434/v1",
+        apiKey: config.apiKey,
+        defaultModel: config.model,
+      });
+    default:
+      throw new Error(`Unknown provider type: ${config.type}`);
+  }
+}
+
+// ============================================
 // API Route Handlers
 // ============================================
 
 async function handleStats(): Promise<Response> {
   try {
-    const [messageCount] = await dbManager.db
+    const db = getDatabase();
+    const [messageCount] = await db
       .select({ count: count() })
       .from(messages);
-    const [workflowCount] = await dbManager.db
+    const [gatewayCount] = await db
       .select({ count: count() })
-      .from(workflows);
-    const [agentCount] = await dbManager.db
-      .select({ count: count() })
-      .from(agents);
-    const [pluginCount] = await dbManager.db
-      .select({ count: count() })
-      .from(plugins);
+      .from(gateways);
 
     const stats: StatsResponse = {
       messages: messageCount?.count ?? 0,
-      workflows: workflowCount?.count ?? 0,
-      agents: agentCount?.count ?? 0,
-      plugins: pluginCount?.count ?? 0,
+      gateways: gatewayCount?.count ?? 0,
       uptime: process.uptime(),
       requests: 0,
-      activeWorkflows: workflowCount?.count ?? 0,
-      agentTasks: 0,
       systemLatency: 0,
       recentActivity: [],
     };
@@ -315,164 +317,80 @@ async function handleStats(): Promise<Response> {
   }
 }
 
-async function handleGetAgents(): Promise<Response> {
+async function handleGetGateways(): Promise<Response> {
   try {
-    const allAgents = await dbManager.db.select().from(agents);
-    return json(allAgents);
+    const db = getDatabase();
+    // Return both database gateways and in-memory instances
+    const dbGateways = await db.select().from(gateways);
+    const memoryGateways = Array.from(gatewayInstances.values()).map((g) => ({
+      ...g.config,
+      status: g.status,
+    }));
+
+    return json({
+      database: dbGateways,
+      running: memoryGateways,
+    });
   } catch (err) {
-    log.error("Failed to get agents:", err);
-    return error("Failed to get agents");
+    log.error("Failed to get gateways:", err);
+    return error("Failed to get gateways");
   }
 }
 
-async function handleCreateAgent(req: Request): Promise<Response> {
+async function handleCreateGateway(req: Request): Promise<Response> {
   try {
+    const db = getDatabase();
     const body = await req.json();
-    const result = await dbManager.db.insert(agents).values(body).returning();
-    return json(result[0], 201);
-  } catch (err) {
-    log.error("Failed to create agent:", err);
-    return error("Failed to create agent");
-  }
-}
+    
+    // Create gateway config
+    const gatewayConfig: GatewayConfig = {
+      id: body.id || `gw_${Date.now()}`,
+      name: body.name,
+      description: body.description,
+      provider: body.provider || { type: "openai" },
+      agent: body.agent || { name: body.name },
+      skills: body.skills || [],
+      tools: body.tools || [],
+      channels: body.channels || [],
+      status: "stopped",
+      createdAt: new Date().toISOString(),
+    };
 
-async function handleAgentChat(req: Request, id: string): Promise<Response> {
-  try {
-    const body = await req.json();
-    const { message } = body;
+    // Create provider instance
+    const provider = createProvider(gatewayConfig.provider);
 
-    // Get agent from database
-    const [agent] = await dbManager.db
-      .select()
-      .from(agents)
-      .where(eq(agents.id, id));
+    // Store in memory
+    gatewayInstances.set(gatewayConfig.id, {
+      config: gatewayConfig,
+      provider,
+      status: "stopped",
+    });
 
-    if (!agent) {
-      return error("Agent not found", 404);
-    }
-
-    // Get the gateway for this agent
-    if (agent.gatewayId) {
-      const [agentGateway] = await dbManager.db
-        .select()
-        .from(gateways)
-        .where(eq(gateways.id, agent.gatewayId));
-
-      if (agentGateway) {
-        // Create a dynamic provider with the gateway's settings
-        const providerConfig = {
-          apiKey: agentGateway.apiKey || undefined,
-          endpoint: agentGateway.endpoint || undefined,
-          defaultModel: agentGateway.defaultModel || undefined,
-          models: agentGateway.models
-            ? JSON.parse(agentGateway.models)
-            : undefined,
-        };
-
-        let provider:
-          | OpenAIProvider
-          | AnthropicProvider
-          | OllamaProvider
-          | null = null;
-
-        // Create appropriate provider based on gateway type
-        if (agentGateway.provider === "openai") {
-          provider = new OpenAIProvider(providerConfig);
-        } else if (agentGateway.provider === "anthropic") {
-          provider = new AnthropicProvider(providerConfig);
-        } else if (agentGateway.provider === "ollama") {
-          provider = new OllamaProvider(providerConfig);
-        }
-
-        if (provider) {
-          // Use the dynamic provider directly
-          const response = await provider.chatCompletion({
-            model: agent.model || agentGateway.defaultModel || "gpt-4o",
-            messages: [
-              ...(agent.systemPrompt
-                ? [{ role: "system" as const, content: agent.systemPrompt }]
-                : []),
-              { role: "user" as const, content: message },
-            ],
-          });
-
-          const content = response.choices[0]?.message?.content || "";
-          return json({ response: content });
-        }
-      }
-    }
-
-    // Fallback: try to delegate through agentManager (for in-memory agents)
-    try {
-      const response = await agentManager.delegate(agent.name, message);
-      return json({ response });
-    } catch {
-      // If agent not in manager, use default gateway
-      const response = await gateway.chatCompletion({
-        model: agent.model || "gpt-4o",
-        messages: [
-          ...(agent.systemPrompt
-            ? [{ role: "system" as const, content: agent.systemPrompt }]
-            : []),
-          { role: "user" as const, content: message },
-        ],
-      });
-
-      const content = response.choices[0]?.message?.content || "";
-      return json({ response: content });
-    }
-  } catch (err) {
-    log.error("Failed to chat with agent:", err);
-    return error("Failed to process chat");
-  }
-}
-
-async function handleGetWorkflows(): Promise<Response> {
-  try {
-    const allWorkflows = await dbManager.db.select().from(workflows);
-    return json(allWorkflows);
-  } catch (err) {
-    log.error("Failed to get workflows:", err);
-    return error("Failed to get workflows");
-  }
-}
-
-async function handleCreateWorkflow(req: Request): Promise<Response> {
-  try {
-    const body = await req.json();
-    const result = await dbManager.db
-      .insert(workflows)
-      .values(body)
+    // Also save to database
+    const result = await db
+      .insert(gateways)
+      .values({
+        id: gatewayConfig.id,
+        name: gatewayConfig.name,
+        provider: gatewayConfig.provider.type,
+        endpoint: gatewayConfig.provider.endpoint,
+        defaultModel: gatewayConfig.provider.model,
+      })
       .returning();
-    return json(result[0], 201);
+
+    return json({ config: gatewayConfig, db: result[0] }, 201);
   } catch (err) {
-    log.error("Failed to create workflow:", err);
-    return error("Failed to create workflow");
-  }
-}
-
-async function handleRunWorkflow(req: Request): Promise<Response> {
-  try {
-    const body = await req.json();
-    const { workflowId, input } = body;
-
-    if (!workflowId) {
-      return error("workflowId is required", 400);
-    }
-
-    const result = await workflowEngine.runWorkflow(workflowId, input || {});
-    return json(result);
-  } catch (err) {
-    log.error("Failed to run workflow:", err);
-    return error("Failed to run workflow");
+    log.error("Failed to create gateway:", err);
+    return error("Failed to create gateway");
   }
 }
 
 async function handleGetMessages(req: Request): Promise<Response> {
   try {
+    const db = getDatabase();
     const url = new URL(req.url);
     const limit = parseInt(url.searchParams.get("limit") || "50");
-    const allMessages = await dbManager.db
+    const allMessages = await db
       .select()
       .from(messages)
       .orderBy(desc(messages.createdAt))
@@ -484,31 +402,16 @@ async function handleGetMessages(req: Request): Promise<Response> {
   }
 }
 
-async function handleGetGateways(): Promise<Response> {
-  try {
-    const allGateways = await dbManager.db.select().from(gateways);
-    return json(allGateways);
-  } catch (err) {
-    log.error("Failed to get gateways:", err);
-    return error("Failed to get gateways");
-  }
-}
-
-async function handleCreateGateway(req: Request): Promise<Response> {
-  try {
-    const body = await req.json();
-    const result = await dbManager.db.insert(gateways).values(body).returning();
-    return json(result[0], 201);
-  } catch (err) {
-    log.error("Failed to create gateway:", err);
-    return error("Failed to create gateway");
-  }
-}
-
 async function handleGetTools(): Promise<Response> {
   try {
-    const allTools = await dbManager.db.select().from(tools);
-    return json(allTools);
+    const db = getDatabase();
+    const allTools = await db.select().from(tools);
+    const registeredTools = toolRegistry.list();
+    
+    return json({
+      database: allTools,
+      registered: registeredTools,
+    });
   } catch (err) {
     log.error("Failed to get tools:", err);
     return error("Failed to get tools");
@@ -528,53 +431,30 @@ async function handleExecuteTool(req: Request): Promise<Response> {
   }
 }
 
-async function handleGetPlugins(): Promise<Response> {
+async function handleGetSkills(): Promise<Response> {
   try {
-    const allPlugins = await dbManager.db.select().from(plugins);
-    return json(allPlugins);
+    const db = getDatabase();
+    const allSkills = await db.select().from(skills);
+    return json({ database: allSkills });
   } catch (err) {
-    log.error("Failed to get plugins:", err);
-    return error("Failed to get plugins");
-  }
-}
-
-async function handleCreatePlugin(req: Request): Promise<Response> {
-  try {
-    const body = await req.json();
-    const result = await dbManager.db.insert(plugins).values(body).returning();
-    return json(result[0], 201);
-  } catch (err) {
-    log.error("Failed to create plugin:", err);
-    return error("Failed to create plugin");
-  }
-}
-
-async function handleTogglePlugin(
-  id: string,
-  enabled: boolean,
-): Promise<Response> {
-  try {
-    const result = await dbManager.db
-      .update(plugins)
-      .set({ enabled: enabled ? 1 : 0 })
-      .where(eq(plugins.id, id))
-      .returning();
-    return json(result[0]);
-  } catch (err) {
-    log.error(`Failed to ${enabled ? "enable" : "disable"} plugin:`, err);
-    return error(`Failed to ${enabled ? "enable" : "disable"} plugin`);
+    log.error("Failed to get skills:", err);
+    return error("Failed to get skills");
   }
 }
 
 async function handleGetLogs(req: Request): Promise<Response> {
   try {
+    const db = getDatabase();
     const url = new URL(req.url);
     const limit = parseInt(url.searchParams.get("limit") || "100");
-    const logs = await dbManager.db
+    
+    // Use messages as logs for now
+    const logs = await db
       .select()
-      .from(eventLogs)
-      .orderBy(desc(eventLogs.createdAt))
+      .from(messages)
+      .orderBy(desc(messages.createdAt))
       .limit(limit);
+    
     return json(logs);
   } catch (err) {
     log.error("Failed to get logs:", err);
@@ -597,94 +477,145 @@ async function handleGetSettings(): Promise<Response> {
   }
 }
 
-async function handleLogin(req: Request): Promise<Response> {
+// ============================================
+// OpenAI-Compatible API Handlers
+// ============================================
+
+async function handleOpenAIChat(req: Request): Promise<Response> {
   try {
     const body = await req.json();
-    const { username, password } = body;
+    const { model, messages: chatMessages, stream, tools } = body;
 
-    const user = await authManager.validateCredentials(username, password);
-    if (!user) {
-      return error("Invalid credentials", 401);
+    // Find a provider for this model
+    const providers = providerRegistry.getAll();
+    let selectedProvider: AIProvider | null = null;
+    let selectedProviderName: string | null = null;
+
+    for (const [name, provider] of providers) {
+      const models = await provider.listModels();
+      if (models.some((m) => m.id === model || m.name === model)) {
+        selectedProvider = provider;
+        selectedProviderName = name;
+        break;
+      }
     }
 
-    // Create an API key for the session
-    const { key } = await authManager.createApiKey(
-      user.id,
-      "session",
-      [],
-      undefined,
-    );
+    // If no provider found, try to use the first available one
+    if (!selectedProvider && providers.size > 0) {
+      const firstEntry = Array.from(providers.entries())[0];
+      if (firstEntry) {
+        selectedProvider = firstEntry[1];
+        selectedProviderName = firstEntry[0];
+      }
+    }
 
-    return json({ user, token: key });
+    if (!selectedProvider) {
+      return error("No AI provider available", 503);
+    }
+
+    const options: GenerateOptions = {
+      messages: chatMessages,
+      model,
+      tools,
+    };
+
+    // Generate response
+    if (stream) {
+      // Handle streaming response
+      const streamGenerator = selectedProvider.stream(options);
+
+      // Create a ReadableStream for SSE
+      const readableStream = new ReadableStream({
+        async start(controller) {
+          try {
+            for await (const chunk of streamGenerator) {
+              const data = JSON.stringify({
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: model || "unknown",
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: chunk.delta },
+                    finish_reason: chunk.done ? chunk.finishReason : null,
+                  },
+                ],
+              });
+              controller.enqueue(`data: ${data}\n\n`);
+            }
+            controller.enqueue("data: [DONE]\n\n");
+            controller.close();
+          } catch (err) {
+            controller.error(err);
+          }
+        },
+      });
+
+      return new Response(readableStream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          ...CORS_HEADERS,
+        },
+      });
+    } else {
+      // Non-streaming response
+      const result = await selectedProvider.generate(options);
+
+      // Get default model from config
+      const defaultModel = configLoader.get().providers?.openai?.defaultModel || "gpt-4o";
+
+      return json({
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model || defaultModel,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: result.text,
+            },
+            finish_reason: result.finishReason || "stop",
+          },
+        ],
+        usage: result.usage,
+      });
+    }
   } catch (err) {
-    log.error("Failed to login:", err);
-    return error("Failed to login");
+    log.error("Failed to handle OpenAI chat:", err);
+    return error("Failed to process chat completion");
   }
 }
 
-async function handleGetApiKeys(): Promise<Response> {
+async function handleOpenAIModels(): Promise<Response> {
   try {
-    const allKeys = await dbManager.db.select().from(apiKeys);
-    // Mask the keys - only show prefix
-    const maskedKeys = allKeys.map((key) => ({
-      ...key,
-      keyHash: undefined,
-      prefix: key.prefix,
-    }));
-    return json(maskedKeys);
+    const providers = providerRegistry.getAll();
+    const allModels: Array<{ id: string; object: string; created: number; owned_by: string }> = [];
+
+    for (const [name, provider] of providers) {
+      const models = await provider.listModels();
+      for (const model of models) {
+        allModels.push({
+          id: model.id,
+          object: "model",
+          created: Math.floor(Date.now() / 1000),
+          owned_by: name,
+        });
+      }
+    }
+
+    return json({
+      object: "list",
+      data: allModels,
+    });
   } catch (err) {
-    log.error("Failed to get API keys:", err);
-    return error("Failed to get API keys");
+    log.error("Failed to get models:", err);
+    return error("Failed to get models");
   }
-}
-
-async function handleCreateApiKey(req: Request): Promise<Response> {
-  try {
-    const body = await req.json();
-    const { name, userId } = body;
-
-    const { key } = await authManager.createApiKey(name, userId, [], undefined);
-    return json({ key }, 201);
-  } catch (err) {
-    log.error("Failed to create API key:", err);
-    return error("Failed to create API key");
-  }
-}
-
-async function handleDeleteApiKey(id: string): Promise<Response> {
-  try {
-    await dbManager.db.delete(apiKeys).where(eq(apiKeys.id, id));
-    return json({ success: true });
-  } catch (err) {
-    log.error("Failed to delete API key:", err);
-    return error("Failed to delete API key");
-  }
-}
-
-// ============================================
-// Auth Helper for Protected Routes
-// ============================================
-
-function unauthorized(): Response {
-  return json({ success: false, error: "Unauthorized" }, 401);
-}
-
-function forbidden(): Response {
-  return json(
-    { success: false, error: "Forbidden - Admin access required" },
-    403,
-  );
-}
-
-async function requireAuth(req: Request): Promise<AuthContext | null> {
-  return await authMiddleware(req);
-}
-
-async function requireAdmin(req: Request): Promise<AuthContext | null> {
-  const auth = await authMiddleware(req);
-  if (!auth.isAuthenticated) return null;
-  if (auth.user?.role !== "admin") return null;
-  return auth;
 }
 
 // ============================================
@@ -706,14 +637,22 @@ async function handleRequest(req: Request): Promise<Response> {
     return json({ status: "ok", timestamp: new Date().toISOString() });
   }
 
-  // OpenAI-compatible API routes (require auth for API key usage)
-  const openaiResponse = await routeOpenAIRequest(req);
-  if (openaiResponse) {
-    return openaiResponse;
+  // ============================================
+  // OpenAI-Compatible API Routes
+  // ============================================
+
+  // Chat completions
+  if (method === "POST" && path === "/v1/chat/completions") {
+    return handleOpenAIChat(req);
+  }
+
+  // Models
+  if (method === "GET" && path === "/v1/models") {
+    return handleOpenAIModels();
   }
 
   // ============================================
-  // Public Routes (no auth required)
+  // Public Routes
   // ============================================
 
   // Stats (public for dashboard)
@@ -721,160 +660,109 @@ async function handleRequest(req: Request): Promise<Response> {
     return handleStats();
   }
 
-  // Auth - Login (public)
-  if (method === "POST" && path === "/api/auth/login") {
-    return handleLogin(req);
-  }
-
-  // Auth - Logout (public)
-  if (method === "POST" && path === "/api/auth/logout") {
-    return json({ success: true });
-  }
-
-  // Webhooks (public - external systems call this)
-  const webhookMatch = path.match(/^\/api\/webhooks\/([^/]+)$/);
-  if (method === "POST" && webhookMatch) {
-    try {
-      const payload = await req.json().catch(() => ({}));
-      await triggerSystem.fire("webhook", { id: webhookMatch[1], payload });
-      return json({
-        success: true,
-        message: `Webhook ${webhookMatch[1]} triggered`,
-      });
-    } catch (err) {
-      return error("Failed to trigger webhook");
-    }
-  }
-
   // ============================================
-  // Protected Routes (auth required)
+  // API Routes
   // ============================================
 
-  // Agents
-  if (path === "/api/agents") {
-    if (method === "GET") {
-      return handleGetAgents();
-    }
-    if (method === "POST") {
-      const auth = await requireAuth(req);
-      if (!auth) return unauthorized();
-      return handleCreateAgent(req);
-    }
-  }
-
-  // Agent chat (requires auth)
-  const agentChatMatch = path.match(/^\/api\/agents\/([^/]+)\/chat$/);
-  if (method === "POST" && agentChatMatch) {
-    return handleAgentChat(req, agentChatMatch[1]);
-  }
-
-  // Workflows
-  if (path === "/api/workflows") {
-    if (method === "GET") {
-      return handleGetWorkflows();
-    }
-    if (method === "POST") {
-      const auth = await requireAuth(req);
-      if (!auth) return unauthorized();
-      return handleCreateWorkflow(req);
-    }
-  }
-
-  // Run workflow (requires auth)
-  if (method === "POST" && path === "/api/workflows/run") {
-    return handleRunWorkflow(req);
-  }
-
-  // Messages (read-only, requires auth)
+  // Messages
   if (method === "GET" && path === "/api/messages") {
     return handleGetMessages(req);
   }
 
-  // Gateways (admin only for write)
+  // Gateways
   if (path === "/api/gateways") {
     if (method === "GET") {
       return handleGetGateways();
     }
     if (method === "POST") {
-      const auth = await requireAdmin(req);
-      if (!auth) return auth === null ? unauthorized() : forbidden();
       return handleCreateGateway(req);
     }
   }
 
-  // Tools (read-only)
+  // Tools
   if (method === "GET" && path === "/api/tools") {
     return handleGetTools();
   }
 
-  // Tool execution (requires auth)
+  // Tool execution
   if (method === "POST" && path === "/api/tools/execute") {
-    const auth = await requireAuth(req);
-    if (!auth) return unauthorized();
     return handleExecuteTool(req);
   }
 
-  // Plugins
-  if (path === "/api/plugins") {
-    if (method === "GET") {
-      return handleGetPlugins();
-    }
-    if (method === "POST") {
-      const auth = await requireAdmin(req);
-      if (!auth) return auth === null ? unauthorized() : forbidden();
-      return handleCreatePlugin(req);
-    }
+  // Skills
+  if (method === "GET" && path === "/api/skills") {
+    return handleGetSkills();
   }
 
-  // Plugin enable/disable (admin only)
-  const pluginToggleMatch = path.match(
-    /^\/api\/plugins\/([^/]+)\/(enable|disable)$/,
-  );
-  if (method === "POST" && pluginToggleMatch) {
-    const auth = await requireAdmin(req);
-    if (!auth) return auth === null ? unauthorized() : forbidden();
-    const [, id, action] = pluginToggleMatch;
-    return handleTogglePlugin(id, action === "enable");
-  }
-
-  // Logs (requires auth)
+  // Logs
   if (method === "GET" && path === "/api/logs") {
-    const auth = await requireAuth(req);
-    if (!auth) return unauthorized();
     return handleGetLogs(req);
   }
 
-  // Settings (admin only)
+  // Settings
   if (method === "GET" && path === "/api/settings") {
-    const auth = await requireAuth(req);
-    if (!auth) return unauthorized();
     return handleGetSettings();
   }
 
-  // API Keys (admin only)
-  if (path === "/api/keys") {
-    if (method === "GET") {
-      const auth = await requireAdmin(req);
-      if (!auth) return auth === null ? unauthorized() : forbidden();
-      return handleGetApiKeys();
+  // RAG endpoints
+  if (method === "POST" && path === "/api/rag/index") {
+    if (!ragEngineInstance) {
+      return error("RAG engine not initialized", 503);
     }
-    if (method === "POST") {
-      const auth = await requireAdmin(req);
-      if (!auth) return auth === null ? unauthorized() : forbidden();
-      return handleCreateApiKey(req);
+    try {
+      const body = await req.json();
+      const { documents } = body;
+      // Ingest documents one by one
+      let indexed = 0;
+      for (const doc of documents) {
+        await ragEngineInstance.ingestDocument(doc.content, doc.metadata);
+        indexed++;
+      }
+      return json({ success: true, indexed });
+    } catch (err) {
+      log.error("Failed to index documents:", err);
+      return error("Failed to index documents");
     }
   }
 
-  // Delete API Key (admin only)
-  const apiKeyDeleteMatch = path.match(/^\/api\/keys\/([^/]+)$/);
-  if (method === "DELETE" && apiKeyDeleteMatch) {
-    const auth = await requireAdmin(req);
-    if (!auth) return auth === null ? unauthorized() : forbidden();
-    return handleDeleteApiKey(apiKeyDeleteMatch[1]);
+  if (method === "POST" && path === "/api/rag/search") {
+    if (!ragEngineInstance) {
+      return error("RAG engine not initialized", 503);
+    }
+    try {
+      const body = await req.json();
+      const { query, topK } = body;
+      const results = await ragEngineInstance.search(query, { topK: topK || 5 });
+      return json({ results });
+    } catch (err) {
+      log.error("Failed to search documents:", err);
+      return error("Failed to search documents");
+    }
   }
 
   // 404 Not Found
   return error("Not found", 404);
+}
+
+// ============================================
+// Parse Command Line Arguments
+// ============================================
+
+function parseArgs(): { port?: number; host?: string } {
+  const args = process.argv.slice(2);
+  const result: { port?: number; host?: string } = {};
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--port" && args[i + 1]) {
+      result.port = parseInt(args[i + 1], 10);
+      i++;
+    } else if (args[i] === "--host" && args[i + 1]) {
+      result.host = args[i + 1];
+      i++;
+    }
+  }
+  
+  return result;
 }
 
 // ============================================
@@ -885,8 +773,10 @@ async function startServer() {
   try {
     await bootstrap();
 
-    const port = configLoader.get().server?.port || 3000;
-    const host = configLoader.get().server?.host || "0.0.0.0";
+    // Parse command line arguments (override config)
+    const cmdArgs = parseArgs();
+    const port = cmdArgs.port || configLoader.get().server?.port || 3000;
+    const host = cmdArgs.host || configLoader.get().server?.host || "0.0.0.0";
 
     log.info(`KendaliAI API starting on http://${host}:${port}`);
 

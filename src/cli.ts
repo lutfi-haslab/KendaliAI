@@ -23,7 +23,7 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { parseArgs } from "util";
 import { securityManager } from "./server/security";
@@ -41,15 +41,66 @@ const VERSION = "0.2.0";
 
 let db: Database | null = null;
 
-// Directory paths
-const KENDALIAI_DIR = join(process.env.HOME || "", ".kendaliai");
-const GATEWAYS_DIR = join(KENDALIAI_DIR, "gateways");
-const RUN_DIR = join(KENDALIAI_DIR, "run");
-const LOGS_DIR = join(KENDALIAI_DIR, "logs");
-const DATA_DIR = join(KENDALIAI_DIR, "data");
+// Directory paths - defaults to project-local, can be overridden with --config-path
+const PROJECT_DIR = process.cwd();
+const HOME_DIR = process.env.HOME || "";
+
+// These will be set based on config-path option
+let KENDALIAI_DIR: string;
+let GATEWAYS_DIR: string;
+let RUN_DIR: string;
+let LOGS_DIR: string;
+let DATA_DIR: string;
+let CONFIG_FILE: string;
+
+// Config type
+interface KendaliAIConfig {
+  database?: {
+    path?: string;
+  };
+  gateways?: unknown[];
+  defaultProvider?: string;
+}
+
+// Initialize directory paths based on config-path option
+function initializePaths(): void {
+  const configPath = getString("config-path");
+  
+  if (configPath === ".kendaliai" || configPath === "~/.kendaliai") {
+    // Use home directory (root system)
+    KENDALIAI_DIR = join(HOME_DIR, ".kendaliai");
+  } else if (configPath) {
+    // Use custom path
+    KENDALIAI_DIR = configPath;
+  } else {
+    // Default: project-local directory
+    KENDALIAI_DIR = join(PROJECT_DIR, ".kendaliai");
+  }
+  
+  GATEWAYS_DIR = join(KENDALIAI_DIR, "gateways");
+  RUN_DIR = join(KENDALIAI_DIR, "run");
+  LOGS_DIR = join(KENDALIAI_DIR, "logs");
+  DATA_DIR = join(KENDALIAI_DIR, "data");
+  CONFIG_FILE = join(KENDALIAI_DIR, "config.json");
+}
+
+// Load config from file
+function loadConfig(): KendaliAIConfig {
+  initializePaths();
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      const configContent = readFileSync(CONFIG_FILE, "utf-8");
+      return JSON.parse(configContent);
+    }
+  } catch (error) {
+    // Config file doesn't exist or is invalid, use defaults
+  }
+  return {};
+}
 
 // Ensure directories exist
 function ensureDirectories(): void {
+  initializePaths();
   [KENDALIAI_DIR, GATEWAYS_DIR, RUN_DIR, LOGS_DIR, DATA_DIR].forEach(dir => {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -76,11 +127,25 @@ function ensureDirectory(filePath: string): void {
   }
 }
 
-function getDb(dbPath: string = ".kendaliai/data.db"): Database {
+function getDb(dbPath?: string): Database {
   if (db) return db;
   ensureDirectories();
-  // Use DATA_DIR if path is default
-  const actualPath = dbPath === ".kendaliai/data.db" ? join(DATA_DIR, "kendaliai.db") : dbPath;
+  
+  // Priority: CLI arg > config file > default
+  const config = loadConfig();
+  let actualPath: string;
+  
+  if (dbPath) {
+    // CLI argument provided
+    actualPath = dbPath;
+  } else if (config.database?.path) {
+    // Config file setting
+    actualPath = config.database.path;
+  } else {
+    // Default
+    actualPath = join(DATA_DIR, "kendaliai.db");
+  }
+  
   ensureDirectory(actualPath);
   db = new Database(actualPath);
   db.run("PRAGMA journal_mode = WAL");
@@ -134,8 +199,11 @@ const { values, positionals } = parseArgs({
     "workspace-only": { type: "boolean", default: true },
     
     // Database options
-    "db-path": { type: "string", default: ".kendaliai/data.db" },
+    "db-path": { type: "string" },
     "reset-db": { type: "boolean", default: false },
+    
+    // Config path option (for root system vs project local)
+    "config-path": { type: "string" },
     
     // Message options
     message: { type: "string", short: "m" },
@@ -180,6 +248,7 @@ COMMANDS:
   status               Show system status
   doctor               Run diagnostics
   reset                Reset database
+  init                 Initialize database tables
 
 GATEWAY MANAGEMENT (Multi-Gateway):
   gateway create <name>     Create new gateway
@@ -249,7 +318,7 @@ SECURITY OPTIONS:
   --workspace-only     Restrict file access to workspace (default: true)
 
 DATABASE OPTIONS:
-  --db-path <path>     Database path (default: .kendaliai/data.db)
+  --db-path <path>     Database path (default: .kendaliai/data/kendaliai.db)
   --reset-db           Reset database on startup
 
 EXAMPLES:
@@ -286,7 +355,7 @@ async function handleVersion(): Promise<void> {
 async function handleOnboard(): Promise<void> {
   console.log("🚀 KendaliAI Onboarding\n");
   
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   
   // Initialize database
   console.log("📁 Initializing database...");
@@ -426,7 +495,7 @@ async function handleOnboard(): Promise<void> {
 async function handleGateway(): Promise<void> {
   const port = parseInt(getString("port", "42617"));
   const host = getString("host", "127.0.0.1");
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   
   console.log(`🚀 Starting KendaliAI Gateway on ${host}:${port}\n`);
   
@@ -721,7 +790,7 @@ async function handleGateway(): Promise<void> {
 
 async function handleAgent(): Promise<void> {
   const message = getString("message", "");
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   
   if (!message) {
     console.log("💬 Interactive mode (not implemented in minimal CLI)");
@@ -826,7 +895,7 @@ async function handleAgent(): Promise<void> {
 }
 
 async function handlePairing(): Promise<void> {
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   const database = getDb(dbPath);
   
   const subCommand = positionals[1];
@@ -873,7 +942,7 @@ async function handlePairing(): Promise<void> {
 }
 
 async function handleChannel(): Promise<void> {
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   const database = getDb(dbPath);
   
   const subCommand = positionals[1];
@@ -975,7 +1044,7 @@ async function handleChannel(): Promise<void> {
 }
 
 async function handleStatus(): Promise<void> {
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   const database = getDb(dbPath);
   
   console.log("📊 KendaliAI Status\n");
@@ -1006,14 +1075,31 @@ async function handleStatus(): Promise<void> {
     let runningCount = 0;
     
     for (const gw of gateways) {
-      const status = gw.status === "running" ? "● Running" : "○ Stopped";
-      const pid = gw.daemon_pid ? String(gw.daemon_pid) : "-";
+      let currentStatus = gw.status;
+      let currentPid = gw.daemon_pid;
+
+      // Check if process is actually alive if marked as running
+      if (currentStatus === "running" && currentPid) {
+        try {
+          process.kill(currentPid, 0);
+        } catch (e) {
+          // Process is not running
+          currentStatus = "stopped";
+          currentPid = null;
+          
+          // Update database for stale status
+          database.run(`UPDATE gateways SET status = 'stopped', daemon_pid = NULL WHERE id = ?`, [gw.id]);
+        }
+      }
+
+      const statusText = currentStatus === "running" ? "● Running" : "○ Stopped";
+      const pidText = currentPid ? String(currentPid) : "-";
       const model = gw.default_model || "-";
       const port = gw.daemon_port || "-";
       
-      if (gw.status === "running") runningCount++;
+      if (currentStatus === "running") runningCount++;
       
-      console.log(`║ ${gw.name.padEnd(14)} ${status.padEnd(9)} ${pid.padEnd(7)} ${gw.provider.padEnd(10)} ${model.padEnd(16)} ${String(port).padEnd(9)}║`);
+      console.log(`║ ${gw.name.padEnd(14)} ${statusText.padEnd(9)} ${pidText.padEnd(7)} ${gw.provider.padEnd(10)} ${model.padEnd(16)} ${String(port).padEnd(9)}║`);
     }
     
     console.log("╚══════════════════════════════════════════════════════════════════════════╝");
@@ -1058,10 +1144,13 @@ async function handleDoctor(): Promise<void> {
   
   const checks: { name: string; status: "ok" | "warn" | "error"; message: string }[] = [];
   
+  // Initialize database and tables
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
+  const database = getDb(dbPath);
+  await initTables(database);
+  
   // Check database
   try {
-    const dbPath = getString("db-path", ".kendaliai/data.db");
-    const database = getDb(dbPath);
     database.query("SELECT 1").get();
     checks.push({ name: "Database", status: "ok", message: "Connected" });
   } catch (e) {
@@ -1070,7 +1159,6 @@ async function handleDoctor(): Promise<void> {
   
   // Check gateway
   try {
-    const database = getDb();
     const gateway = database.query<{ id: string }, []>(`
       SELECT id FROM gateways LIMIT 1
     `).get();
@@ -1086,7 +1174,6 @@ async function handleDoctor(): Promise<void> {
   
   // Check pairing
   try {
-    const database = getDb();
     const gateway = database.query<{ id: string }, []>(`
       SELECT id FROM gateways LIMIT 1
     `).get();
@@ -1111,7 +1198,7 @@ async function handleDoctor(): Promise<void> {
 }
 
 async function handleReset(): Promise<void> {
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   
   console.log("⚠️  This will delete all data!");
   console.log(`   Database: ${dbPath}`);
@@ -1139,6 +1226,29 @@ async function handleReset(): Promise<void> {
   await initTables(database);
   
   console.log("✅ Database reset complete");
+}
+
+async function handleInit(): Promise<void> {
+  const cliDbPath = getString("db-path");
+  const config = loadConfig();
+  
+  // Priority: CLI arg > config file > default
+  let dbPath: string;
+  if (cliDbPath) {
+    dbPath = cliDbPath;
+  } else if (config.database?.path) {
+    dbPath = config.database.path;
+  } else {
+    dbPath = join(DATA_DIR, "kendaliai.db");
+  }
+  
+  console.log("🔄 Initializing database...");
+  
+  const database = getDb(dbPath);
+  await initTables(database);
+  
+  console.log("✅ Database initialized successfully");
+  console.log(`   Location: ${dbPath}`);
 }
 
 // ============================================
@@ -1438,7 +1548,7 @@ async function startTelegramBot(
 }
 
 async function handleDaemon(): Promise<void> {
-  const dbPath = getString("db-path", ".kendaliai/data.db");
+  const dbPath = getString("db-path", ".kendaliai/data/kendaliai.db");
   const database = getDb(dbPath);
   
   console.log("🤖 Starting KendaliAI Daemon (Telegram Bot Only)\n");
@@ -1758,7 +1868,7 @@ async function main(): Promise<void> {
       // Multi-gateway management
       const subCommand = positionals[1];
       const subArgs = positionals.slice(2);
-      const database = getDb(getString("db-path", ".kendaliai/data.db"));
+      const database = getDb(getString("db-path", ".kendaliai/data/kendaliai.db"));
       await initTables(database);
       
       // Get options from values object
@@ -1766,6 +1876,12 @@ async function main(): Promise<void> {
       const model = getString("model");
       const apiKey = getString("api-key");
       const apiUrl = getString("api-url");
+      
+      // Get gateway-specific options
+      const daemon = Boolean((values as Record<string, unknown>)["daemon"]);
+      const port = (values as Record<string, unknown>)["port"];
+      const host = getString("host");
+      const force = Boolean((values as Record<string, unknown>)["force"]);
       
       // Build combined args array that includes both positional args and options
       const fullArgs = [...subArgs];
@@ -1781,6 +1897,18 @@ async function main(): Promise<void> {
       if (apiUrl) {
         fullArgs.push("--api-url", apiUrl);
       }
+      if (daemon) {
+        fullArgs.push("--daemon");
+      }
+      if (port) {
+        fullArgs.push("--port", String(port));
+      }
+      if (host) {
+        fullArgs.push("--host", host);
+      }
+      if (force) {
+        fullArgs.push("--force");
+      }
       
       const { handleGatewayCommand } = await import("./cli/gateway");
       await handleGatewayCommand(database, subCommand || "list", fullArgs);
@@ -1790,7 +1918,7 @@ async function main(): Promise<void> {
       // Daemon management
       const subCommand = positionals[1];
       const subArgs = positionals.slice(2);
-      const database = getDb(getString("db-path", ".kendaliai/data.db"));
+      const database = getDb(getString("db-path", ".kendaliai/data/kendaliai.db"));
       await initTables(database);
       
       const { handleDaemonCommand } = await import("./cli/daemon");
@@ -1820,7 +1948,7 @@ async function main(): Promise<void> {
       // Channel routing management
       const subCommand = positionals[1] || "help";
       const subArgs = positionals.slice(2);
-      const database = getDb(getString("db-path", ".kendaliai/data.db"));
+      const database = getDb(getString("db-path", ".kendaliai/data/kendaliai.db"));
       await initTables(database);
       
       const { handleRoutingCommand } = await import("./cli/routing");
@@ -1832,6 +1960,9 @@ async function main(): Promise<void> {
       break;
     case "reset":
       await handleReset();
+      break;
+    case "init":
+      await handleInit();
       break;
     case "rag": {
       // RAG (Retrieval-Augmented Generation) management

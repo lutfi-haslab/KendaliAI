@@ -77,7 +77,7 @@ function getDb(): Database {
   if (globalDb) return globalDb;
   
   // Otherwise create new connection
-  return new Database(".kendaliai/data.db");
+  return new Database(".kendaliai/data/kendaliai.db");
 }
 
 /**

@@ -14,6 +14,7 @@ plans
 dist-ssr
 *.local
 .tanstack
+.kendaliai
 
 # Environment files (contain sensitive credentials)
 .env
