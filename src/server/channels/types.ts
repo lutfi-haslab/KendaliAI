@@ -227,6 +227,8 @@ export interface Channel {
   setTyping(chatId: string): Promise<void>;
   /** Register command handler */
   onCommand(command: string, handler: (ctx: CommandContext) => Promise<void>): void;
+  /** Set channel commands (for UI display) */
+  setCommands(commands: Array<{ command: string; description: string }>): Promise<void>;
   /** Register message handler */
   onMessage(handler: (message: ChannelMessage) => Promise<void>): void;
   /** Register callback handler */

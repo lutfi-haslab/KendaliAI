@@ -40,6 +40,7 @@ import type { AIProvider, GenerateOptions, StreamChunk, ChatMessage } from "./pr
 // Tools
 import { toolRegistry } from "./tools/registry";
 import { getSkillRegistry } from "./skills/registry";
+import { getSkillsManager, BUILTIN_TOOLS } from "./skills";
 
 // Routing
 import { RoutingManager } from "./routing";
@@ -204,6 +205,122 @@ async function bootstrap() {
  * Handle events coming from messaging channels
  */
 function setupChannelEvents(db: any) {
+  // 0. Register global bot commands (for UI discoverability)
+  for (const [id, channel] of channelManager.getAll()) {
+    if (channel.type === 'telegram') {
+        channel.setCommands([
+            { command: 'start', description: 'Initialize and pair your account' },
+            { command: 'ask', description: 'Ask a question using RAG knowledge base' },
+            { command: 'ingest', description: 'Save information to knowledge base' },
+            { command: 'skills', description: 'List installed skills' },
+            { command: 'tools', description: 'List equipped tools' },
+            { command: 'help', description: 'Show help and usage' }
+        ]).then(() => log.info(`✅ Commands registered for Telegram channel: ${id}`))
+          .catch(err => log.error(`❌ Failed to set commands for ${id}:`, err));
+
+        // Add tools command handler
+        channel.onCommand('tools', async (ctx) => {
+            let toolsText = "⚒️ *Equipped Tools*\n\n";
+            try {
+                const channelId = ctx.channel.name;
+                const [dbChannel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1);
+                const gatewayId = dbChannel?.gatewayId;
+
+                const manager = getSkillsManager(dbManager.getRaw()!);
+                let toolsList = [];
+                
+                if (gatewayId) {
+                    toolsList = manager.getEnabledTools(gatewayId);
+                    toolsText = `⚒️ *Equipped Tools* (Gateway: \`${gatewayId}\`)\n\n`;
+                } else {
+                    // Fallback to registry if no gateway link found
+                    toolsList = toolRegistry.list();
+                }
+
+                if (toolsList.length > 0) {
+                    toolsText += toolsList.map((t: any) => {
+                        const description = t.description || BUILTIN_TOOLS[t.name]?.description || "No description";
+                        return `⚡ \`${t.name}\`: ${description}`;
+                    }).join('\n');
+                } else {
+                    toolsText += "_No tools equipped for this gateway._";
+                }
+            } catch (err) {
+                log.warn("Failed to fetch tools for Telegram:", err);
+                toolsText += "❌ _Failed to fetch tools._";
+            }
+            await ctx.channel.sendMessage(toolsText, { chatId: ctx.message.chatId, parseMode: 'markdown' });
+        });
+
+        // Add skills command handler
+        channel.onCommand('skills', async (ctx) => {
+            let skillsText = "🧩 *Active Skills*\n\n";
+            try {
+                const channelId = ctx.channel.name; // Internal ID
+                const [dbChannel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1);
+                const gatewayId = dbChannel?.gatewayId;
+
+                const manager = getSkillsManager(dbManager.getRaw()!);
+                let active = [];
+                
+                if (gatewayId) {
+                    active = manager.getEnabledSkills(gatewayId);
+                    skillsText = `🧩 *Active Skills* (Gateway: \`${gatewayId}\`)\n\n`;
+                } else {
+                    active = manager.listAvailableSkills();
+                }
+
+                if (active.length > 0) {
+                    skillsText += active.map((s: any) => `• **${s.name}**: ${s.description}`).join('\n');
+                } else {
+                    skillsText += "_No skills enabled for this gateway._";
+                }
+            } catch (err) {
+                log.warn("Failed to fetch skills for Telegram:", err);
+                skillsText += "❌ _Failed to fetch skills._";
+            }
+            await ctx.channel.sendMessage(skillsText, { chatId: ctx.message.chatId, parseMode: 'markdown' });
+        });
+
+        // Add help command handler
+        channel.onCommand('help', async (ctx) => {
+            // Get enabled skills for this channel's gateway
+            let skillsList = "None";
+            try {
+                const channelId = ctx.channel.name;
+                const [dbChannel] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1);
+                const gatewayId = dbChannel?.gatewayId;
+
+                const manager = getSkillsManager(dbManager.getRaw()!);
+                let active = [];
+                if (gatewayId) {
+                    active = manager.getEnabledSkills(gatewayId);
+                } else {
+                    active = manager.listAvailableSkills();
+                }
+
+                if (active.length > 0) {
+                    skillsList = active.map((s: any) => `\`${s.name}\``).join(', ');
+                }
+            } catch (err) {
+                log.warn("Failed to fetch skills for help:", err);
+            }
+
+            const helpText = `🛠 *KendaliAI Help*\n\n` +
+                `Autonomous AI Gateway & Agent Loop\n\n` +
+                `⚡ *Skills:* ${skillsList}\n\n` +
+                `*Commands:*\n` +
+                `• \`/start\` - Initialize and pair your account\n` +
+                `• \`/ask <query>\` - Explicit RAG search\n` +
+                `• \`/ingest <text>\` - Save to long-term memory\n` +
+                `• \`/skills\` - List all installed skills\n` +
+                `• \`/tools\` - List equipped tools\n\n` +
+                `_Normal messages are automatically routed between Chat, RAG, and Agent Loop._`;
+            await ctx.channel.sendMessage(helpText, { chatId: ctx.message.chatId, parseMode: 'markdown' });
+        });
+    }
+  }
+
   channelManager.onEvent(async (event) => {
     if (event.type === 'message_received' && event.data) {
       const message = event.data as ChannelMessage;
@@ -214,26 +331,30 @@ function setupChannelEvents(db: any) {
       const userName = message.displayName || message.username || "User";
 
       log.info(`📩 [${channelId}/${userName}] ${text}`);
-
-      // 1. Handle pairing commands (/init, /start)
-      if (text === "/init" || text === "/start") {
-        // Find gateway for this channel - use first one or default
-        const gatewayId = gatewayInstances.keys().next().value || "default";
-        
-        try {
-          const result = await securityManager.createPairing(gatewayId);
-          if (result.success && result.pairingCode) {
-            const reply = `🔐 *Pairing Required*\n\nYour User ID: \`${userId}\`\n\nEnter the pairing code to continue.\n\nPairing Code: \`${result.pairingCode}\`\n\n_Type the 6-digit code to pair your account._`;
-            
-            const channel = channelManager.get(event.channel);
-            if (channel) {
-                await channel.sendMessage(reply, { chatId, parseMode: 'markdown' } as SendMessageOptions);
-            }
+      
+      const commandsToSkip = ['/skills', '/tools', '/help', '/start', '/init'];
+      if (commandsToSkip.some(cmd => text.startsWith(cmd))) {
+          // 1. Handle pairing commands (/init, /start) explicitly if needed
+          if (text === "/init" || text === "/start") {
+              // Find gateway for this channel - use first one or default
+              const gatewayId = gatewayInstances.keys().next().value || "default";
+              
+              try {
+                  const result = await securityManager.createPairing(gatewayId);
+                  if (result.success && result.pairingCode) {
+                      const reply = `🔐 *Pairing Required*\n\nYour User ID: \`${userId}\`\n\nEnter the pairing code to continue.\n\nPairing Code: \`${result.pairingCode}\`\n\n_Type the 6-digit code to pair your account._`;
+                      
+                      const channel = channelManager.get(event.channel);
+                      if (channel) {
+                          await channel.sendMessage(reply, { chatId, parseMode: 'markdown' } as SendMessageOptions);
+                      }
+                  }
+              } catch (err) {
+                  log.error("Failed to handle pairing command:", err);
+              }
           }
-        } catch (err) {
-          log.error("Failed to handle pairing command:", err);
-        }
-        return;
+          // Manual commands handled by individual handlers, skip autonomous routing
+          return;
       }
 
       // 2. Handle pairing code (6 digits)

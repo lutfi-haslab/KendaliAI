@@ -31,6 +31,7 @@ export interface SkillConfig {
 
 export interface ToolConfig {
   name: string;
+  description: string;
   enabled: boolean;
   riskLevel: ToolRiskLevel;
   config: Record<string, unknown>;
@@ -161,6 +162,7 @@ export const BUILTIN_SKILLS: Record<string, Partial<SkillConfig>> = {
 export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   shell: {
     name: "shell",
+    description: "Execute shell commands with security sandboxing",
     enabled: true,
     riskLevel: "high",
     config: {
@@ -172,6 +174,7 @@ export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   },
   git: {
     name: "git",
+    description: "Git repository management and version control",
     enabled: true,
     riskLevel: "medium",
     config: {},
@@ -180,6 +183,7 @@ export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   },
   file: {
     name: "file",
+    description: "Read, write and list files in your projects",
     enabled: true,
     riskLevel: "medium",
     config: {
@@ -190,6 +194,7 @@ export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   },
   http: {
     name: "http",
+    description: "Fetch web content and interact with APIs",
     enabled: true,
     riskLevel: "low",
     config: {
@@ -201,6 +206,7 @@ export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   },
   memory: {
     name: "memory",
+    description: "Recall and store long-term contextual information",
     enabled: true,
     riskLevel: "low",
     config: {
@@ -212,6 +218,7 @@ export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   },
   browser: {
     name: "browser",
+    description: "Automate web browsing and interaction",
     enabled: false,
     riskLevel: "medium",
     config: {
@@ -223,6 +230,7 @@ export const BUILTIN_TOOLS: Record<string, Partial<ToolConfig>> = {
   },
   python: {
     name: "python",
+    description: "Run Python code and data analysis scripts",
     enabled: false,
     riskLevel: "high",
     config: {
@@ -429,6 +437,7 @@ export class SkillsManager {
         if (foundTool) {
           toolBase = {
             name: foundTool.name,
+            description: foundTool.description || `${foundTool.name} tool`,
             enabled: true,
             riskLevel: "medium", // Default for custom tools
             config: foundTool.parameters || {},

@@ -180,6 +180,10 @@ export class TelegramChannel extends BaseChannel {
     await this.bot.api.sendChatAction(chatId, "typing");
   }
 
+  async setCommands(commands: Array<{ command: string; description: string }>): Promise<void> {
+    await this.bot.api.setMyCommands(commands);
+  }
+
   private convertMessage(ctx: Context): ChannelMessage | null {
     if (!ctx.message) return null;
     return this.convertGrammyMessage(ctx.message);

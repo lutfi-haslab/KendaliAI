@@ -149,6 +149,9 @@ export abstract class BaseChannel implements Channel {
   abstract getChatInfo(chatId: string): Promise<ChatInfo>;
   abstract getUserInfo(userId: string): Promise<UserInfo>;
   abstract setTyping(chatId: string): Promise<void>;
+  async setCommands(commands: Array<{ command: string; description: string }>): Promise<void> {
+    // Default implementation does nothing
+  }
 
   onCommand(command: string, handler: (ctx: CommandContext) => Promise<void>): void {
     this.commandHandlers.set(command, handler);
