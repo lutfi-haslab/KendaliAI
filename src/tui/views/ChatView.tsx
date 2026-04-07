@@ -15,10 +15,17 @@ interface ChatViewProps {
   onExit: () => void;
 }
 
-export const ChatView: React.FC<ChatViewProps> = ({ db, gatewayName, onExit }) => {
+export const ChatView: React.FC<ChatViewProps> = ({
+  db,
+  gatewayName,
+  onExit,
+}) => {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([
-    { role: "assistant", content: `Hey! I'm ${gatewayName}. What are we building today?` }
+    {
+      role: "assistant",
+      content: `Hey! I'm ${gatewayName}. What are we building today?`,
+    },
   ]);
   const [loading, setLoading] = useState(false);
 
@@ -37,9 +44,15 @@ export const ChatView: React.FC<ChatViewProps> = ({ db, gatewayName, onExit }) =
     setInput("");
     try {
       const response = await runAgentDirect(db, gatewayName, input);
-      setMessages((prev) => [...prev, { role: "assistant", content: response }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: response },
+      ]);
     } catch (err: any) {
-      setMessages((prev) => [...prev, { role: "system", content: `Error: ${err.message}` }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "system", content: `Error: ${err.message}` },
+      ]);
     } finally {
       setLoading(false);
     }
@@ -47,8 +60,15 @@ export const ChatView: React.FC<ChatViewProps> = ({ db, gatewayName, onExit }) =
 
   return (
     <Box flexDirection="column" height="100%">
-      <Box borderStyle="single" borderColor="cyan" paddingX={1} marginBottom={1}>
-        <Text bold color="cyan">💬 Chatting with {gatewayName}</Text>
+      <Box
+        borderStyle="single"
+        borderColor="cyan"
+        paddingX={1}
+        marginBottom={1}
+      >
+        <Text bold color="cyan">
+          💬 Chatting with {gatewayName}
+        </Text>
         <Box flexGrow={1} />
         <Text color="gray">Press ESC to return to Dashboard</Text>
       </Box>
@@ -56,8 +76,21 @@ export const ChatView: React.FC<ChatViewProps> = ({ db, gatewayName, onExit }) =
       <Box flexDirection="column" flexGrow={1} paddingX={1}>
         {messages.slice(-10).map((msg, i) => (
           <Box key={i} marginBottom={1}>
-            <Text bold color={msg.role === "user" ? "blue" : msg.role === "system" ? "red" : "green"}>
-              {msg.role === "user" ? "You: " : msg.role === "system" ? "System: " : `${gatewayName}: `}
+            <Text
+              bold
+              color={
+                msg.role === "user"
+                  ? "blue"
+                  : msg.role === "system"
+                    ? "red"
+                    : "green"
+              }
+            >
+              {msg.role === "user"
+                ? "You: "
+                : msg.role === "system"
+                  ? "System: "
+                  : `${gatewayName}: `}
             </Text>
             <Text>{msg.content}</Text>
           </Box>
