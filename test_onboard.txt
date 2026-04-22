@@ -1,10 +1,14 @@
-.kendaliai
-KatrinaAI
-deepseek
-deepseek-chat
-sk-proj_xxxx
-TestAPIKey123
-y
-katrina-bot
-Y
+# 1. Initialize the system database, create the workspace, and bootstrap the default Gateway
+go run ./cmd/kendaliai onboard
 
+# 2. Bind your Telegram bot to the gateway
+go run ./cmd/kendaliai channel bind-telegram --bot-token "xxxxxx:xxxx"
+
+# 3. Launch the Gateway daemon to start receiving Telegram requests
+go run ./cmd/kendaliai gateway
+
+# 4. (Optional) Run the local dashboard agent directly
+go run ./cmd/kendaliai tui
+
+# 5. Logs
+go run ./cmd/kendaliai logs
